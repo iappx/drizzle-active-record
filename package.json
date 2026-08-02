@@ -1,0 +1,68 @@
+{
+  "name": "@iappx/drizzle-active-record",
+  "version": "1.0.0",
+  "description": "A decorator-driven Active Record layer over Drizzle ORM for PostgreSQL: declare entities with decorators, get a chainable query builder, relations, soft delete and hydration on top of the generated Drizzle schema.",
+  "homepage": "https://github.com/iappx/drizzle-active-record#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iappx/drizzle-active-record.git"
+  },
+  "bugs": {
+    "url": "https://github.com/iappx/drizzle-active-record/issues"
+  },
+  "keywords": [
+    "typescript",
+    "drizzle",
+    "drizzle-orm",
+    "orm",
+    "active-record",
+    "query-builder",
+    "postgres",
+    "postgresql",
+    "decorators",
+    "entity",
+    "model",
+    "relations",
+    "soft-delete"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "rimraf ./lib && tsc -p tsconfig.json",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "lib",
+    "src"
+  ],
+  "main": "./lib/index.js",
+  "typings": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "author": "iappx",
+  "license": "MIT",
+  "peerDependencies": {
+    "drizzle-orm": ">=0.45.0",
+    "pg": ">=8.7.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.3",
+    "@types/node": "^18.19.0",
+    "@types/pg": "8.6.1",
+    "drizzle-orm": "^0.45.2",
+    "jest": "^29.2.1",
+    "pg": "^8.7.3",
+    "rimraf": "^3.0.2",
+    "ts-jest": "^29.0.3",
+    "typescript": "5.9.2"
+  }
+}
