@@ -1,3 +1,5 @@
+import { PgDialect } from 'drizzle-orm/pg-core'
+
 /**
  * Chainable stub for the drizzle `db` object so BaseModel/DBModelQuery can be
  * exercised without a real Postgres connection. Records the arguments passed to
@@ -5,8 +7,19 @@
  */
 export type TMockDb = {
     db: any
-    /** captured config of the last query[table].findMany / findFirst */
-    captured: { cfg?: any }
+    /** captured config of the last query[table].findMany / findFirst, and of the last flat select */
+    captured: {
+        cfg?: any
+        selection?: any
+        from?: any
+        selectWhere?: any
+        groupBy?: any[]
+        having?: any
+        selectOrderBy?: any[]
+        limit?: number
+        offset?: number
+        statement?: any
+    }
     calls: {
         update: jest.Mock
         insert: jest.Mock
@@ -19,6 +32,8 @@ export type TMockDb = {
         findMany: jest.Mock
         findFirst: jest.Mock
         count: jest.Mock
+        select: jest.Mock
+        execute: jest.Mock
     }
     /** rows returned by insert/update .returning() */
     returningRows: unknown[]
@@ -28,6 +43,10 @@ export type TMockDb = {
     findFirstRow: unknown
     /** count returned by $count */
     countValue: number
+    /** rows returned by awaiting a flat select chain */
+    selectRows: unknown[]
+    /** rows returned by db.execute() */
+    executeRows: unknown[]
 }
 
 export function createMockDb(tableNames: string[]): TMockDb {
@@ -38,6 +57,8 @@ export function createMockDb(tableNames: string[]): TMockDb {
         findManyRows: [],
         findFirstRow: null,
         countValue: 0,
+        selectRows: [],
+        executeRows: [],
         calls: {
             update: jest.fn(),
             insert: jest.fn(),
@@ -50,6 +71,8 @@ export function createMockDb(tableNames: string[]): TMockDb {
             findMany: jest.fn(),
             findFirst: jest.fn(),
             count: jest.fn(),
+            select: jest.fn(),
+            execute: jest.fn(),
         },
     }
 
@@ -108,10 +131,36 @@ export function createMockDb(tableNames: string[]): TMockDb {
             state.calls.delete(table)
             return { where: async (w: unknown) => state.calls.deleteWhere(w) }
         },
-        // минимальный select-чейн для построения EXISTS-подзапросов (required-include)
-        select: () => ({
-            from: () => ({ where: () => ({ __subquery: true }) }),
-        }),
+        // Flat select chain: builds EXISTS sub-queries (required-include) when it is not awaited,
+        // and resolves to `selectRows` when it is (aggregates, grouped selects).
+        select: (selection: unknown) => {
+            state.calls.select(selection)
+            state.captured.selection = selection
+            const chain: Record<string, unknown> = { __subquery: true }
+            const step = (key: keyof TMockDb['captured'], variadic = false) =>
+                (...args: unknown[]) => {
+                    state.captured[key] = (variadic ? args : args[0]) as never
+                    return chain
+                }
+            Object.assign(chain, {
+                from: step('from'),
+                where: step('selectWhere'),
+                groupBy: step('groupBy', true),
+                having: step('having'),
+                orderBy: step('selectOrderBy', true),
+                limit: step('limit'),
+                offset: step('offset'),
+                then: (resolve: (v: unknown) => unknown, reject: (e: unknown) => unknown) =>
+                    Promise.resolve(state.selectRows).then(resolve, reject),
+            })
+            return chain
+        },
+        execute: async (statement: unknown) => {
+            state.calls.execute(statement)
+            state.captured.statement = statement
+            return { rows: state.executeRows }
+        },
+        dialect: new PgDialect(),
     }
 
     return state

@@ -4,6 +4,7 @@ import { Hydrator } from './Hydrator'
 import { Orm } from '../connection/Orm'
 import { Tx } from '../connection/types'
 import { DBModelQuery } from '../query/DBModelQuery'
+import { RecursiveDBModelQuery } from '../query/RecursiveDBModelQuery'
 import { TRawIncludeInput } from '../query/types'
 import { TTableMeta } from '../types/metadata'
 
@@ -36,6 +37,10 @@ export abstract class BaseModel<M extends BaseModel = any, CA extends object = a
 
     static query<M extends BaseModel>(this: new () => M): DBModelQuery<M> {
         return new DBModelQuery<M>(this)
+    }
+
+    static recursiveQuery<M extends BaseModel>(this: new () => M): RecursiveDBModelQuery<M> {
+        return new RecursiveDBModelQuery<M>(this)
     }
 
     static hydrate<M extends BaseModel>(this: new () => M, row: Record<string, unknown>): M | null {

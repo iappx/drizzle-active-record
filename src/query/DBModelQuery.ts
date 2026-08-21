@@ -1,10 +1,25 @@
-import { and, asc, desc, eq, exists, isNull, or, SQL, sql } from 'drizzle-orm'
+import {
+    aliasedTable,
+    and,
+    asc,
+    desc,
+    eq,
+    exists,
+    isNull,
+    mapColumnsInSQLToAlias,
+    max as sqlMax,
+    min as sqlMin,
+    or,
+    SQL,
+    sql,
+} from 'drizzle-orm'
 import { ModelRegistry } from '../registry/ModelRegistry'
 import { Hydrator } from '../model/Hydrator'
 import { Orm } from '../connection/Orm'
 import { Tx } from '../connection/types'
 import { TRelationMeta, TTableMeta } from '../types/metadata'
 import { SchemaBuilder } from '../schema/SchemaBuilder'
+import { RelationForeignKey } from '../schema/RelationForeignKey'
 import { ConditionBuilder } from './ConditionBuilder'
 import { DBIncludeQuery } from './DBIncludeQuery'
 import { QueryExecutor } from './QueryExecutor'
@@ -12,8 +27,13 @@ import { QueryNode } from './QueryNode'
 import { OrderItemColumn, TColumns, TIncludeOptions, TRawInclude, TRawIncludeInput, TWhere } from './types'
 
 export class DBModelQuery<M> {
+    /** Suffix of the alias the child of a self-referencing `required` include is given. */
+    public static readonly ExistsAliasSuffix = '__exists'
+
     protected node: QueryNode = new QueryNode()
     protected tx?: Tx
+    // reads go to the write connection unless the caller opts into the replica
+    protected replica = false
     protected readonly meta: TTableMeta
 
     constructor(protected modelCtor: new () => M) {
@@ -21,7 +41,7 @@ export class DBModelQuery<M> {
     }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private get table(): any {
+    protected get table(): any {
         if (!this.meta.drizzleTable) {
             // fallback for entry points that never ran the bootstrap (tests/scripts)
             SchemaBuilder.build()
@@ -135,35 +155,45 @@ export class DBModelQuery<M> {
     private buildExistsCondition(parentMeta: TTableMeta, childMeta: TTableMeta, rel: TRelationMeta, extra: SQL[]): SQL | undefined {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const parentTable = parentMeta.drizzleTable as any
+        // A self-referencing relation would otherwise compare the subquery's own row with itself —
+        // `WHERE position.account_id = position.account_id`, true for every row and correlated to
+        // nothing. The child side gets an alias so the parent row stays reachable.
+        const selfJoin = !!childMeta.drizzleTable && childMeta.drizzleTable === parentMeta.drizzleTable
+        const alias = `${childMeta.tableName}${DBModelQuery.ExistsAliasSuffix}`
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const childTable = childMeta.drizzleTable as any
+        const childTable = (selfJoin ? aliasedTable(childMeta.drizzleTable as any, alias) : childMeta.drizzleTable) as any
 
         let link: SQL | undefined
         if (rel.kind === 'hasMany' || rel.kind === 'belongsToMany') {
-            const fkCol = childMeta.columns.find(c => c.foreignKeyTarget && c.foreignKeyTarget() === parentMeta.modelCtor)
+            // the foreign key lives on the child and points back at the parent
+            const fkCol = RelationForeignKey.find(childMeta, parentMeta.modelCtor, rel.foreignKey)
             if (fkCol) {
-                link = eq(childTable[fkCol.propertyKey], parentTable[parentMeta.primaryKey])
+                link = eq(childTable[fkCol.propertyKey], parentTable[RelationForeignKey.findReferencedKey(parentMeta, rel)])
             }
         } else {
-            const fkCol = parentMeta.columns.find(c => c.foreignKeyTarget && c.foreignKeyTarget() === childMeta.modelCtor)
+            const fkCol = RelationForeignKey.find(parentMeta, childMeta.modelCtor, rel.foreignKey)
             if (fkCol) {
-                link = eq(childTable[childMeta.primaryKey], parentTable[fkCol.propertyKey])
+                link = eq(childTable[RelationForeignKey.findReferencedKey(childMeta, rel)], parentTable[fkCol.propertyKey])
             }
         }
         if (!link) {
             return undefined
         }
-        const soft = this.softDeleteCondition(childMeta)
-        const conditions = soft ? [...extra, soft] : extra
+        // conditions were built against the real table; under an alias they have to follow it,
+        // or they would silently filter the parent row instead of the child
+        const scoped = selfJoin ? extra.map(c => mapColumnsInSQLToAlias(c, alias)) : extra
+        const soft = this.softDeleteCondition(childMeta, childTable)
+        const conditions = soft ? [...scoped, soft] : scoped
         const where = conditions.length ? and(link, ...conditions) : link
         const sub = Orm.conn(this.tx).select({ e: sql`1` }).from(childTable).where(where)
         return exists(sub)
     }
 
-    private softDeleteCondition(meta?: TTableMeta): SQL | undefined {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private softDeleteCondition(meta?: TTableMeta, table?: any): SQL | undefined {
         if (meta?.paranoid && meta.deletedAtKey && meta.drizzleTable) {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            return isNull((meta.drizzleTable as any)[meta.deletedAtKey])
+            return isNull((table ?? (meta.drizzleTable as any))[meta.deletedAtKey])
         }
         return undefined
     }
@@ -206,6 +236,24 @@ export class DBModelQuery<M> {
         return col ? this.table[col.propertyKey] : undefined
     }
 
+    // grouping switches execution off the relational query builder onto a flat select:
+    // RQB cannot express GROUP BY, and grouped rows are no longer whole entities
+    public groupBy(columns: OrderItemColumn | OrderItemColumn[]): this {
+        const items = Array.isArray(columns) ? columns : [columns]
+        for (const item of items) {
+            const column = item instanceof SQL ? item : this.resolveOrderColumn(item)
+            if (column) {
+                this.node.groupBy.push(column)
+            }
+        }
+        return this
+    }
+
+    public having(condition: SQL): this {
+        this.node.having.push(condition)
+        return this
+    }
+
     public limit(value: number): this {
         this.node.limit = value
         return this
@@ -218,6 +266,17 @@ export class DBModelQuery<M> {
 
     public transaction(t?: Tx): this {
         this.tx = t
+        return this
+    }
+
+    // routes this query to the read replica; without a configured replica it stays on the primary
+    public useReplica(): this {
+        this.replica = true
+        return this
+    }
+
+    public useMaster(): this {
+        this.replica = false
         return this
     }
 
@@ -248,9 +307,13 @@ export class DBModelQuery<M> {
         }
         const throughMeta = ModelRegistry.require(rel.through())
         const targetCtor = rel.target()
-        const targetRel = throughMeta.relations.find(r => r.target() === targetCtor)
+        const targetRel = RelationForeignKey.junctionRelation(throughMeta, targetCtor, rel.otherKey)
         if (!targetRel) {
-            throw new Error(`Junction ${throughMeta.tableName} has no belongsTo relation to ${(targetCtor as { name?: string }).name}`)
+            const via = rel.otherKey ? ` on column "${rel.otherKey}" (from { otherKey })` : ''
+            throw new Error(
+                `Junction ${throughMeta.tableName} has no belongsTo relation to `
+                + `${(targetCtor as { name?: string }).name}${via}`,
+            )
         }
         const targetNode = new QueryNode()
         const junctionNode = new QueryNode()
@@ -271,11 +334,127 @@ export class DBModelQuery<M> {
     }
 
     public async getAll(): Promise<M[]> {
-        const rows = await this.runFindMany()
+        const rows = this.node.groupBy.length ? await this.runGroupedSelect() : await this.runFindMany()
         return Hydrator.hydrateMany(this.modelCtor, rows)
     }
 
+    public async max<T = unknown>(field: string): Promise<T> {
+        return this.aggregate<T>(sqlMax, field)
+    }
+
+    public async min<T = unknown>(field: string): Promise<T> {
+        return this.aggregate<T>(sqlMin, field)
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private async aggregate<T>(fn: (column: any) => SQL<any>, field: string): Promise<T> {
+        const column = this.resolveOrderColumn(field)
+        if (!column) {
+            throw new Error(`Unknown column "${field}" on ${this.meta.tableName}`)
+        }
+        const rows = await QueryExecutor.run<{ value: T }[]>(() =>
+            Orm.conn(this.tx, this.replica)
+                .select({ value: fn(column) })
+                .from(this.table)
+                .where(this.whereCondition()),
+        )
+        return rows[0]?.value ?? (null as T)
+    }
+
+    protected whereCondition(): SQL | undefined {
+        const conditions = [...this.node.where]
+        const soft = this.softDeleteCondition(this.meta)
+        if (soft) {
+            conditions.push(soft)
+        }
+        return conditions.length ? and(...conditions) : undefined
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    protected buildFlatSelection(): Record<string, any> {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const selection: Record<string, any> = {}
+        for (const col of this.meta.columns) {
+            if (!this.node.columns || this.node.columns[col.propertyKey]) {
+                selection[col.propertyKey] = this.table[col.propertyKey]
+            }
+        }
+        for (const [key, value] of Object.entries(this.node.extras ?? {})) {
+            selection[key] = value
+        }
+        return selection
+    }
+
+    private async runGroupedSelect(): Promise<Record<string, unknown>[]> {
+        return QueryExecutor.run<Record<string, unknown>[]>(() => this.buildSelectQuery())
+    }
+
+    // A hand-rendered flat SELECT. Columns keep the names they have in the database, so the
+    // result of one of these can stand in for the table itself — which is what a recursive CTE
+    // relies on when it unions two terms and is then read like an ordinary table.
+    protected renderSelectSql(from?: SQL): SQL {
+        const parts: SQL[] = []
+        const fields = Object.entries(this.buildFlatSelection()).map(([key, expr]) => {
+            const alias = this.meta.columns.find(c => c.propertyKey === key)?.columnName ?? key
+            // select extras arrive as SQL.Aliased; the alias is re-applied here
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const inner = (expr as any)?.sql ?? expr
+            return sql`${inner} as ${sql.identifier(alias)}`
+        })
+        parts.push(sql`select ${sql.join(fields, sql`, `)}`)
+        parts.push(sql`from ${from ?? this.table}`)
+        const where = this.whereCondition()
+        if (where) {
+            parts.push(sql`where ${where}`)
+        }
+        if (this.node.groupBy.length) {
+            parts.push(sql`group by ${sql.join(this.node.groupBy, sql`, `)}`)
+        }
+        if (this.node.having.length) {
+            parts.push(sql`having ${and(...this.node.having)}`)
+        }
+        if (this.node.orderBy.length) {
+            parts.push(sql`order by ${sql.join(this.node.orderBy, sql`, `)}`)
+        }
+        if (this.node.limit != null) {
+            parts.push(sql`limit ${this.node.limit}`)
+        }
+        if (this.node.offset != null) {
+            parts.push(sql`offset ${this.node.offset}`)
+        }
+        return sql.join(parts, sql` `)
+    }
+
+    // the flat (non-RQB) form of this query: grouping and recursive CTEs both build on it
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    protected buildSelectQuery(): any {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let query: any = Orm.conn(this.tx, this.replica).select(this.buildFlatSelection()).from(this.table)
+        const where = this.whereCondition()
+        if (where) {
+            query = query.where(where)
+        }
+        query = query.groupBy(...this.node.groupBy)
+        if (this.node.having.length) {
+            query = query.having(this.node.having.length === 1 ? this.node.having[0] : and(...this.node.having))
+        }
+        if (this.node.orderBy.length) {
+            query = query.orderBy(...this.node.orderBy)
+        }
+        if (this.node.limit != null) {
+            query = query.limit(this.node.limit)
+        }
+        if (this.node.offset != null) {
+            query = query.offset(this.node.offset)
+        }
+        return QueryExecutor.run<Record<string, unknown>[]>(() => query)
+    }
+
     public async getOne(): Promise<M | null> {
+        if (this.node.groupBy.length) {
+            const rows = await this.limit(1).runGroupedSelect()
+            return Hydrator.hydrate(this.modelCtor, rows[0])
+        }
         const cfg = this.buildConfig(this.node, this.meta)
         const row = await QueryExecutor.run<Record<string, unknown>>(() => this.rqb().findFirst(cfg))
         return Hydrator.hydrate(this.modelCtor, row)
@@ -303,13 +482,7 @@ export class DBModelQuery<M> {
     }
 
     public async count(_distinct = true): Promise<number> {
-        const conditions = [...this.node.where]
-        const soft = this.softDeleteCondition(this.meta)
-        if (soft) {
-            conditions.push(soft)
-        }
-        const where = conditions.length ? and(...conditions) : undefined
-        return Orm.conn(this.tx).$count(this.meta.drizzleTable, where)
+        return Orm.conn(this.tx, this.replica).$count(this.meta.drizzleTable, this.whereCondition())
     }
 
     public async delete(): Promise<void> {
@@ -327,8 +500,8 @@ export class DBModelQuery<M> {
     }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private rqb(): any {
-        return Orm.conn(this.tx).query[this.meta.tableName]
+    protected rqb(): any {
+        return Orm.conn(this.tx, this.replica).query[this.meta.tableName]
     }
 
     private async runFindMany(): Promise<Record<string, unknown>[]> {

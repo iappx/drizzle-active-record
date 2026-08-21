@@ -10,5 +10,8 @@ export class QueryNode {
     public orderBy: (SQL | any)[] = []
     public limit?: number
     public offset?: number
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    public groupBy: (SQL | any)[] = []
+    public having: SQL[] = []
     public with: Record<string, QueryNode> = {}
 }

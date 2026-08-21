@@ -10,5 +10,8 @@ export type TModelNotFoundErrorFactory = (model: Function) => Error
 export type TOrmInitOptions = {
     pool?: Pool
     db?: TOrmDatabase
+    // read replica: only queries that explicitly ask for it are routed here
+    readPool?: Pool
+    readDb?: TOrmDatabase
     modelNotFoundErrorFactory?: TModelNotFoundErrorFactory
 }

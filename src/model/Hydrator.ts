@@ -1,4 +1,5 @@
 import { ModelRegistry } from '../registry/ModelRegistry'
+import { RelationForeignKey } from '../schema/RelationForeignKey'
 
 export class Hydrator {
     static hydrate<M>(ctor: new () => M, row: Record<string, unknown> | null | undefined): M | null {
@@ -20,7 +21,10 @@ export class Hydrator {
 
         for (const key of Object.keys(row)) {
             if (!columnKeys.has(key) && !relationKeys.has(key)) {
+                // computed columns (select extras, aggregates) are reachable both as a plain
+                // property and through getDataValue(), the way a real column is
                 inst[key] = row[key]
+                inst.setDataValue(key, row[key])
             }
         }
 
@@ -34,7 +38,9 @@ export class Hydrator {
             if (rel.kind === 'belongsToMany') {
                 // loaded through the junction: raw rows are junction rows, the target sits in a nested key
                 const throughMeta = rel.through ? ModelRegistry.get(rel.through()) : undefined
-                const targetRelKey = throughMeta?.relations.find(r => r.target() === RelClass)?.propertyKey
+                const targetRelKey = throughMeta
+                    ? RelationForeignKey.junctionRelation(throughMeta, RelClass, rel.otherKey)?.propertyKey
+                    : undefined
                 const junctionRows = Array.isArray(raw) ? raw : []
                 inst[rel.propertyKey] = targetRelKey
                     ? junctionRows
