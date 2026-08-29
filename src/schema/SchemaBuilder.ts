@@ -7,6 +7,22 @@ import { PgSchemaDialect } from './dialect/PgSchemaDialect'
 import { RelationForeignKey } from './RelationForeignKey'
 import { INamingStrategy } from '../naming/INamingStrategy'
 
+/**
+ * Turns the registered models into the drizzle schema the ORM runs on.
+ *
+ * The schema is built once, at application start, after every model file has been imported: column
+ * names are resolved, one drizzle table and one recursive twin are created per model, accessors are
+ * installed on the model prototypes, and every relation's join columns are resolved. The dialect and
+ * the naming strategy are installed before that; afterwards they are fixed.
+ *
+ * @example
+ * ```ts
+ * import './models'
+ *
+ * SchemaBuilder.setNamingStrategy(new SnakeCaseNamingStrategy())
+ * const db = drizzle(pool, { schema: SchemaBuilder.build() })
+ * ```
+ */
 export class SchemaBuilder {
     /** Suffix of the twin table a recursive query targets. */
     public static readonly RecursiveSuffix = '__recursive'
@@ -19,6 +35,19 @@ export class SchemaBuilder {
     private static dialect: ISchemaDialect = new PgSchemaDialect()
     private static namingStrategy?: INamingStrategy
 
+    /**
+     * Installs the schema dialect the tables and columns are built with.
+     *
+     * Defaults to {@link PgSchemaDialect}. Call it before {@link SchemaBuilder.build}.
+     *
+     * @throws {Error} When the schema has already been built
+     *
+     * @example
+     * ```ts
+     * SchemaBuilder.setDialect(new PgSchemaDialect())
+     * SchemaBuilder.build()
+     * ```
+     */
     static setDialect(dialect: ISchemaDialect): void {
         if (this.built) {
             throw new Error('SchemaBuilder dialect cannot be changed after the schema has been built')
@@ -26,8 +55,21 @@ export class SchemaBuilder {
         this.dialect = dialect
     }
 
-    // there is no implicit convention: a column without an explicit name is only
-    // resolvable once the application declares how its database names things
+    /**
+     * Installs the strategy that derives a database column name from a property key.
+     *
+     * There is no default: a column declared without an explicit name is unresolvable until a
+     * strategy is installed, and {@link SchemaBuilder.build} throws naming it. Call it before
+     * building the schema.
+     *
+     * @throws {Error} When the schema has already been built
+     *
+     * @example
+     * ```ts
+     * SchemaBuilder.setNamingStrategy(new SnakeCaseNamingStrategy()) // firstName -> first_name
+     * SchemaBuilder.build()
+     * ```
+     */
     static setNamingStrategy(namingStrategy: INamingStrategy): void {
         if (this.built) {
             throw new Error('SchemaBuilder naming strategy cannot be changed after the schema has been built')
@@ -35,6 +77,22 @@ export class SchemaBuilder {
         this.namingStrategy = namingStrategy
     }
 
+    /**
+     * Builds the drizzle schema from every registered model and returns it.
+     *
+     * Idempotent: the second call returns the schema built by the first. The keys are the table
+     * names, each model's recursive twin, and a `<tableName>Relations` config per table.
+     *
+     * @returns The schema object to hand to `drizzle(pool, { schema })`
+     * @throws {Error} When a column has no name and no naming strategy is installed, or when a
+     * relation cannot resolve exactly one join column
+     *
+     * @example
+     * ```ts
+     * SchemaBuilder.setNamingStrategy(new SnakeCaseNamingStrategy())
+     * const db = drizzle(new Pool({ host: 'localhost' }), { schema: SchemaBuilder.build() })
+     * ```
+     */
     static build(): Record<string, unknown> {
         if (this.built) {
             return this.schema
@@ -76,10 +134,12 @@ export class SchemaBuilder {
         return this.schema
     }
 
+    /** The built schema, building it first if that has not happened yet. */
     static getSchema(): Record<string, unknown> {
         return this.built ? this.schema : this.build()
     }
 
+    /** Whether the schema has been built, and the dialect and naming strategy are therefore fixed. */
     static isBuilt(): boolean {
         return this.built
     }
@@ -102,26 +162,43 @@ export class SchemaBuilder {
     private static installAccessors(meta: TTableMeta): void {
         const proto = (meta.modelCtor as { prototype: object }).prototype
         for (const col of meta.columns) {
-            const key = col.propertyKey
-            if (Object.getOwnPropertyDescriptor(proto, key)) {
-                continue
-            }
-            Object.defineProperty(proto, key, {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                get(this: any) {
-                    return this.dataValues[key]
-                },
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                set(this: any, value: unknown) {
-                    if (this.dataValues[key] !== value) {
-                        this.dataValues[key] = value
+            this.defineAccessor(proto, col.propertyKey, true, col.propertyKey === meta.primaryKey)
+        }
+        // A loaded relation lives in `dataValues` too, so `dataValues` / `getDataValue()` hold the
+        // whole loaded row — columns, computed extras and relations alike. Consumers that read a
+        // model through that bag (the Sequelize contract this layer reproduces) would otherwise see
+        // every included relation as `undefined` while it sits on the instance.
+        for (const rel of meta.relations) {
+            this.defineAccessor(proto, rel.propertyKey, false)
+        }
+    }
+
+    // without the primary key no-op, `update({ id: 'other' })` builds `UPDATE … SET id = 'other'
+    // WHERE id = 'other'` — the WHERE is read after the assignment — and silently matches no row
+    private static defineAccessor(proto: object, key: string, track: boolean, isPrimaryKey = false): void {
+        if (Object.getOwnPropertyDescriptor(proto, key)) {
+            return
+        }
+        Object.defineProperty(proto, key, {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            get(this: any) {
+                return this.dataValues[key]
+            },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            set(this: any, value: unknown) {
+                if (isPrimaryKey && this.dataValues[key] != null) {
+                    return
+                }
+                if (this.dataValues[key] !== value) {
+                    this.dataValues[key] = value
+                    if (track) {
                         this._changed.add(key)
                     }
-                },
-                enumerable: true,
-                configurable: true,
-            })
-        }
+                }
+            },
+            enumerable: true,
+            configurable: true,
+        })
     }
 
     private static buildColumns(meta: TTableMeta): Record<string, TColumnBuilder> {
@@ -165,6 +242,22 @@ export class SchemaBuilder {
         }))
     }
 
+    /**
+     * Builds the drizzle relations config for one model, keyed by relation property key.
+     *
+     * A `belongsTo` becomes a `one`, a `hasMany` a `many`, and a `belongsToMany` a `many` onto its
+     * junction table. Relations whose target or junction is not registered are skipped. With
+     * `recursive`, the config hangs off the model's recursive twin instead of its real table.
+     *
+     * @param one Drizzle's `one` builder, as handed to a `relations(...)` callback
+     * @param many Drizzle's `many` builder, as handed to a `relations(...)` callback
+     *
+     * @example
+     * ```ts
+     * const config = relations(Author.meta.drizzleTable, ({ one, many }) =>
+     *     SchemaBuilder.buildRelationConfig(Author.meta, one, many))
+     * ```
+     */
     static buildRelationConfig(
         meta: TTableMeta,
         one: (table: unknown, config?: unknown) => unknown,
@@ -186,7 +279,6 @@ export class SchemaBuilder {
             const pairing = recursive ? { relationName: this.recursiveRelationName(meta, rel) } : undefined
 
             if (rel.kind === 'belongsTo') {
-                // the foreign key sits on this model and points at the target
                 const fkCol = this.relationForeignKey(meta, rel)
                 if (fkCol) {
                     out[rel.propertyKey] = one(targetTable, {
@@ -210,7 +302,6 @@ export class SchemaBuilder {
         return out
     }
 
-    /** Resolves (and thereby validates) both join columns of every relation this model declares. */
     private static validateRelations(meta: TTableMeta): void {
         for (const rel of meta.relations) {
             this.relationForeignKey(meta, rel)
@@ -222,7 +313,6 @@ export class SchemaBuilder {
             if (rel.kind !== 'belongsToMany') {
                 continue
             }
-            // the far half of a m2m: the junction column pointing at the target
             const throughCtor = rel.through?.()
             const throughMeta = throughCtor ? ModelRegistry.get(throughCtor) : undefined
             if (throughMeta) {
@@ -238,11 +328,6 @@ export class SchemaBuilder {
         }
     }
 
-    /**
-     * The column carrying the foreign key of a relation, which is not always on the model that
-     * declares it: a belongsTo holds its own key, a hasMany reads the one on its target, and a
-     * belongsToMany the one the junction points back with.
-     */
     private static relationForeignKey(meta: TTableMeta, rel: TRelationMeta): TColumnMeta | undefined {
         const targetMeta = ModelRegistry.get(rel.target())
         if (!targetMeta) {
@@ -277,12 +362,6 @@ export class SchemaBuilder {
         })
     }
 
-    /**
-     * The column the foreign key points at, as a property key. It sits opposite the foreign key:
-     * a belongsTo lands on its target ({@link TRelationOptions.targetKey}), a hasMany and the
-     * junction hop of a belongsToMany land back on the declaring model
-     * ({@link TRelationOptions.sourceKey}). Left unnamed it is the primary key, as before.
-     */
     private static relationReferencedKey(meta: TTableMeta, targetMeta: TTableMeta, rel: TRelationMeta): string {
         return RelationForeignKey.resolveReferencedKey({
             ownerMeta: rel.kind === 'belongsTo' ? targetMeta : meta,
@@ -291,12 +370,8 @@ export class SchemaBuilder {
         })
     }
 
-    /**
-     * Drizzle resolves a `many` through the `one` pointing back at it, and picks that reverse
-     * relation by table — which is exactly what an explicit `foreignKey` or `sourceKey` overrides.
-     * Naming the relation ties the `many` to the back-reference built for it in
-     * {@link buildExplicitFkBackRefs}.
-     */
+    // drizzle picks the `one` behind a `many` by table, which is what an explicit foreignKey or
+    // sourceKey overrides; the relation name ties it to the back-reference instead
     private static explicitFkPairing(meta: TTableMeta, rel: TRelationMeta): { relationName: string } | undefined {
         return rel.foreignKey || rel.sourceKey ? { relationName: this.explicitFkRelationName(meta, rel) } : undefined
     }
@@ -305,11 +380,7 @@ export class SchemaBuilder {
         return `${SchemaBuilder.ForeignKeyPrefix}:${meta.tableName}.${rel.propertyKey}`
     }
 
-    /**
-     * The other half of {@link explicitFkPairing}: for every `many` landing on this table with an
-     * explicit foreign key or source key, the table gets the matching `one` so drizzle joins on
-     * those columns instead of inferring them. The extra keys are internal and never queried.
-     */
+    // the extra keys are internal and never queried
     private static buildExplicitFkBackRefs(
         meta: TTableMeta,
         one: (table: unknown, config?: unknown) => unknown,
@@ -341,11 +412,8 @@ export class SchemaBuilder {
         return out
     }
 
-    /**
-     * Drizzle infers a `many` relation from the `one` pointing back at it. Nothing points back at a
-     * recursive twin, so for every `many` a twin declares, the table on the other end gets the
-     * matching `one`, tied by relation name. The extra keys are internal and never queried.
-     */
+    // drizzle infers a `many` from the `one` pointing back at it, and nothing points back at a
+    // recursive twin; the extra keys are internal and never queried
     private static buildRecursiveBackRefs(
         meta: TTableMeta,
         one: (table: unknown, config?: unknown) => unknown,
@@ -375,7 +443,6 @@ export class SchemaBuilder {
         return out
     }
 
-    /** Models declaring a `many` (hasMany, or the junction hop of a belongsToMany) landing on this table. */
     private static manySideSources(meta: TTableMeta): { parent: TTableMeta; rel: TRelationMeta }[] {
         const out: { parent: TTableMeta; rel: TRelationMeta }[] = []
         for (const parent of ModelRegistry.all()) {

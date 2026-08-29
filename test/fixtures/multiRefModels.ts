@@ -51,7 +51,6 @@ export class TransferRule extends QueryableModel<TransferRule, TTransferRuleCA> 
     targetWalletType: WalletType
 }
 
-/** Self-referencing twice over: `parent` and `sponsor` walk different columns of the same table. */
 @Table('people')
 export class Person extends QueryableModel<Person, { name: string }> {
     @NamedColumn(DataType.BIGINT, 'id', { primaryKey: true, autoIncrement: true })

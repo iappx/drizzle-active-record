@@ -1,9 +1,5 @@
 import { DataType, NamedColumn, QueryableModel, Table } from '../../src'
 
-/**
- * Fixture covering every column type the dialect can emit. Kept apart from the main
- * model graph so the shared fixtures stay focused on relations.
- */
 @Table('typed_entities')
 export class TypedEntity extends QueryableModel<TypedEntity> {
     @NamedColumn(DataType.BIGINT, 'id', { primaryKey: true, autoIncrement: true })
@@ -28,7 +24,6 @@ export class TypedEntity extends QueryableModel<TypedEntity> {
     @NamedColumn(DataType.DECIMAL(15, 4, { mode: 'string' }), 'exact_amount')
     exactAmount: string
 
-    // mode without precision/scale
     @NamedColumn(DataType.DECIMAL({ mode: 'string' }), 'exact_unsized_amount')
     exactUnsizedAmount: string
 

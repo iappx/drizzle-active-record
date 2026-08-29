@@ -85,7 +85,7 @@ describe('relation metadata', () => {
 
     it('links @ForeignKey target onto the FK column', () => {
         const authorId = Book.meta.columns.find(c => c.propertyKey === 'authorId')
-        expect(authorId?.foreignKeyTarget?.()).toBe(Author)
+        expect(authorId?.foreignKeyTargets?.map(target => target())).toEqual([Author])
     })
 })
 

@@ -9,6 +9,10 @@ export * from './errors'
 export * from './filter'
 export * from './model'
 export * from './query'
+export * from './sql'
+export * from './dialect'
 
 // re-exported so consumers build raw conditions with the very same drizzle instance
 export { sql, SQL } from 'drizzle-orm'
+export { avg, count, countDistinct, max, min, sum, sumDistinct } from 'drizzle-orm'
+export { asc, desc } from 'drizzle-orm'

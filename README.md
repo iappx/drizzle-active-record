@@ -178,9 +178,9 @@ await program.destroy()  // soft delete — the row stays, deletedAt is set
 > Everything after this point is reference material — jump to what you need:
 > [Models](#-models) · [Column naming](#-column-naming) · [Bootstrap](#-bootstrap) · [Querying](#-querying) ·
 > [Grouping](#-grouping) · [Recursive queries](#-recursive-queries) · [Filters](#-filter-operators) ·
-> [Relations](#-relations--includes) · [Writing](#-writing-data) ·
+> [Relations](#-relations--includes) · [TableRef](#-tableref--correlated-sub-queries-from-metadata) · [Writing](#-writing-data) ·
 > [Transactions](#-transactions) · [Soft delete](#-soft-delete) · [Raw SQL](#-raw-sql-escape-hatches) ·
-> [TypeScript setup](#-typescript-setup)
+> [SQL expressions](#-sql-expressions--fn-and-pgexpr) · [TypeScript setup](#-typescript-setup)
 
 ---
 
@@ -280,6 +280,9 @@ export class UpperSnakeCaseNamingStrategy implements INamingStrategy {
 }
 ```
 
+`StringUtils` carries the two conversions the bundled strategies are built from — `toSnakeCase` and
+`toPascalCase`.
+
 > [!WARNING]
 > If a column has neither an explicit name nor a strategy, `SchemaBuilder.build()` throws and names the
 > offending `Model.property`. An unnamed column never reaches the database by accident.
@@ -290,8 +293,10 @@ Table names are always explicit: `@Table('training_program')`.
 
 ```ts
 Orm.init({ pool })                           // builds the schema and creates the db instance
-Orm.init({ db: drizzle(pool, { schema }) })  // or hand over a ready drizzle instance
 Orm.init({ pool, readPool })                 // with a read replica
+
+const schema = SchemaBuilder.build()         // or build it yourself ...
+Orm.init({ db: drizzle(pool, { schema }) })  // ... and hand over a ready drizzle instance
 ```
 
 | Member | Purpose |
@@ -302,6 +307,11 @@ Orm.init({ pool, readPool })                 // with a read replica
 | `Orm.hasReplica` | `true` when a replica was configured. |
 | `Orm.isInitialized` | `true` once `init` has run. |
 | `Orm.close()` | Ends the pools the ORM created itself. |
+
+The schema side is `SchemaBuilder`: `build()` turns the decorated models into the Drizzle schema and
+returns it (`Orm.init({ pool })` calls it for you, and calling it twice returns the same object),
+`getSchema()` returns it and builds first if needed, and `isBuilt()` reports whether the dialect and
+naming strategy are already fixed — both must be set before the first build.
 
 ### Read replicas
 
@@ -331,18 +341,58 @@ Orm.init({ pool, modelNotFoundErrorFactory: model => new MyNotFoundException(mod
 
 | Method | Description |
 |---|---|
-| `.where(options)` | AND-merged conditions. Scalar → `=`, array → `IN`, `null` → `IS NULL`, `Op.*` wrapper, or a raw `SQL`. |
-| `.orWhere(options)` | ORs this call against everything accumulated so far. |
+| `.where(options)` | AND-merged conditions. Scalar → `=`, array → `IN`, `null` → `IS NULL`, `Op.*` wrapper, or a raw `SQL`. Also takes a list of those, or nothing — see [Conditions built at runtime](#conditions-built-at-runtime). |
+| `.orWhere(options)` | ORs this call against everything accumulated so far. Takes the same shapes. |
 | `.select(columns)` | `['id', 'title']`, `{ id: true }`, or `{ extras: { ... } }` for computed columns. |
-| `.orderBy(column, direction)` | Also accepts `[[column, direction], ...]` or a raw `SQL`. |
+| `.selectExcept(columns)` | Every column but the named ones. An unknown name throws. |
+| `.orderBy(column, direction)` | Also accepts `[[column, direction], ...]` or a raw `SQL`. See [Ordering](#ordering). |
 | `.limit(n)` / `.offset(n)` | Pagination. |
 | `.groupBy(columns)` | Column names or raw `SQL`. See [Grouping](#-grouping). |
 | `.having(condition)` | A raw `SQL` condition applied after grouping. |
 | `.includeModel(Model, { as? })` | Opens a typed sub-query on a relation — closed with `.endInclude()`. |
-| `.include(...)` / `.includeQueryable(...)` | Raw includes; `{ required: true }` becomes `WHERE EXISTS`. |
+| `.include(...)` / `.includeQueryable(..., { as?, required? })` | Raw includes; `{ required: true }` becomes `WHERE EXISTS`. |
+| `.existsRelation({ model?, as?, where? })` | That same `WHERE EXISTS` returned as a condition instead of applied. See [Filtering by a relation](#filtering-by-a-relation-without-loading-it). |
 | `.transaction(tx)` | Runs inside an existing Drizzle transaction. |
 | `.useReplica()` / `.useMaster()` | Picks the connection for this read. |
-| `.column(field)` | The underlying Drizzle column, for hand-written `SQL`. |
+| `.column(field)` | The underlying Drizzle column, for hand-written `SQL`. Also available as [`Model.column(field)`](#-raw-sql-escape-hatches) without a query. |
+
+### Ordering
+
+`.orderBy()` takes one thing to sort by — a column name, a raw expression, a `[column, direction]`
+pair — or a list of them:
+
+```ts
+.orderBy('createdAt', 'DESC')                       // column + direction
+.orderBy('title')                                   // column, no direction — sorts ASC
+.orderBy(sql`${q.column('rating')} desc nulls last`) // a whole raw expression
+.orderBy([['title', 'ASC'], ['createdAt', 'DESC']])  // several at once
+.orderBy([[sql`lower(${Author.column('name')})`, 'DESC'], ['age', 'ASC']])   // mixed
+.orderBy(['title', 'createdAt'])                     // several columns, all ASC
+.orderBy(expressions)                                // a list built elsewhere — [] adds nothing
+```
+
+An entry with no direction sorts ascending — a bare column name, a pair without a direction, and
+`DBIncludeQuery.orderBy()`'s own default all agree on this. Anything that is not a column name, a
+`SQL` expression, a pair or a list of those is rejected with a message naming the model.
+
+Inside a list, an entry that is itself an array is a `[column, direction]` pair — unless it starts
+with an array, which makes it a nested list and flattens. That is what keeps a ready
+`[[col, dir], ...]` list working when it is handed to `orderBy` as one entry among others.
+
+A column that can't be resolved — an unknown name, a wrong model prefix, or a path deeper than
+`Model.column` — throws instead of being dropped, so a typo surfaces where it happens rather than
+as a query that looks sorted but isn't:
+
+```ts
+.orderBy('nope')                 // throws: Unknown orderBy column "nope" on <table>
+.orderBy('Other.created_at')     // throws: wrong model prefix
+.orderBy('a.b.c')                // throws: path deeper than "Model.column"
+```
+
+`.max()` and `.min()` throw on an unknown field too. `.groupBy()` is the exception — it drops an
+unresolvable column silently. A `direction` passed alongside a raw `SQL` expression also throws: the
+expression carries its own direction, so the argument would go nowhere. A nullish `item` — from an
+optional sort parameter, say — is ignored, so `.orderBy(maybeUndefinedColumn)` keeps chaining safely.
 
 **Execution**
 
@@ -355,14 +405,50 @@ Orm.init({ pool, modelNotFoundErrorFactory: model => new MyNotFoundException(mod
 | `.tryFindByPk(id)` | `M` — throws when missing |
 | `.count()` | `number` |
 | `.max(field)` / `.min(field)` | the aggregate value, or `null` for an empty set |
+| `.update(values)` | Mass update of every matching row — `undefined` values are dropped |
 | `.delete()` | Mass delete — soft on `paranoid` models |
 | `.toSQL()` | `{ sql, params }` without executing — great for debugging and tests |
+
+### Picking columns
+
+`.select()` names what to keep; `.selectExcept()` names what to drop, which is the shorter of the two
+whenever a table has one heavy column and everything else is wanted:
+
+```ts
+await Post.query().select(['id', 'title']).getAll()
+await Post.query().selectExcept(['body']).getAll()   // throws if "body" is not a column
+```
+
+An unknown name throws in both — a column dropped by a typo makes the row that comes back wrong
+rather than missing.
+
+### A query as a sub-select
+
+`.asSubQuery(column?)` turns a built query into `(select <column> from <table> where ...)` for
+embedding in another query's condition. The column defaults to the primary key; `orderBy`, `limit`
+and `offset` carry over, includes are ignored, and soft delete still applies:
+
+```ts
+const published = Post.query().where({ status: 'published' })
+
+const authors = await User.query()
+    .where({ id: Op.in(published.asSubQuery('authorId')) })
+    .getAll()
+```
+
+The sub-select keeps its own table and its own bind parameters, so it survives being nested inside a
+query that aliases tables of its own.
 
 ## 📊 Grouping
 
 `.groupBy()` takes the query off the relational query builder — Drizzle's RQB cannot express
 `GROUP BY` — and runs a flat select instead. Relations (`with`) are not available on a grouped query;
 everything else (`where`, `orderBy`, `limit`, `offset`) works as usual.
+
+> [!NOTE]
+> Unlike `.orderBy()`, an unresolvable column passed to `.groupBy()` is dropped silently rather than
+> throwing. A typo there changes the grouping with no error to show for it — read the statement back
+> with `.toSQL()` when the result looks wrong.
 
 ```ts
 const duplicates = await Profile.query()
@@ -410,6 +496,11 @@ recursive query filter **the result of the recursion**, not the source table.
 | `.step(query)` | The recursive term. Required. |
 | `.on(condition)` | Join between the collected rows and the step — a callback `(cte, step) => SQL`, or a raw `SQL`. Required. |
 | `.distinct()` | `UNION` instead of the default `UNION ALL`. |
+
+The `anchor` and `step` queries may carry their own `.where(...)`, `.orderBy(...)`, `.groupBy(...)`,
+`.having(...)`, `.limit(...)` and `.offset(...)` — they narrow that term of the recursion. On the
+step term the library places its `INNER JOIN` back to the collected rows right after `FROM`,
+ahead of those clauses, so the generated SQL stays valid regardless of what the term sets.
 
 Execution is the same as any other query: `.getAll()`, `.getOne()`, `.getByPK()`, `.count()`,
 `.toSQL()`.
@@ -489,10 +580,62 @@ await User.query()
 | Text | `like` `notLike` `iLike` `notILike` |
 | Sets | `in` `notIn` `between` `notBetween` |
 | Null | `isNull` `isNotNull` |
+| Three-valued | `is(true \| false \| null)` `isNot(true \| false \| null)` |
 | Combinators | `and(...)` `or(...)` — within a single column |
 
 `Op.eq(null)` / `Op.ne(null)` collapse to `IS NULL` / `IS NOT NULL` automatically.
 For raw condition arrays there is `SqlConditions.allOf(conditions)` and `SqlConditions.anyOf(conditions)`.
+
+### Conditions built at runtime
+
+A filter layer hands back a list of conditions whose length it does not know in advance. Every
+`where` — the query's, an include's, a `TableRef` path's — takes that list as it is and ANDs it,
+and takes `undefined` as "no condition", so nothing has to be counted or unwrapped first:
+
+```ts
+const conditions: SQL[] = buildFilters(request)   // may be empty
+
+await User.query()
+    .where(conditions)                            // [] adds nothing
+    .include({ model: Post, where: conditions })  // same shape inside a branch
+    .getAll()
+```
+
+`SqlConditions.allOf` is for when the conditions have to become **one** value — to be ORed with
+something else, negated, or stored — and its `SQL | undefined` result goes into a `where`
+unguarded:
+
+```ts
+query.where(SqlConditions.anyOf([
+    SqlConditions.allOf(conditions) ?? sql`true`,
+    query.existsRelation({ model: Post }),
+]))
+```
+
+### Three-valued logic — `Op.is` / `Op.isNot`
+
+`Op.is(value)` and `Op.isNot(value)` emit SQL's `IS` predicate — `is true`, `is not true`,
+`is false`, `is not false`, `is null`, `is not null` — with the keyword inlined, because
+`x is $1` is a syntax error.
+
+```ts
+await User.query()
+    .where({
+        isActive: Op.is(true),        // is true
+        isBanned: Op.isNot(true),     // is not true  — false OR NULL
+        archivedAt: Op.is(null),      // is null      — same as Op.isNull()
+    })
+    .getAll()
+```
+
+> [!WARNING]
+> **`Op.isNot(true)` is not `Op.ne(true)`.** On a nullable column `<> true` evaluates to NULL for
+> the NULL rows, so they are filtered out; `IS NOT TRUE` evaluates to true and keeps them. Rewriting
+> a hand-written `IS NOT TRUE` as `Op.ne(true)` loses those rows and reports no error.
+
+`Op.is(null)` / `Op.isNot(null)` are exactly `Op.isNull()` / `Op.isNotNull()` — the same predicate,
+kept as separate spellings. Reach for the `is` pair when the value is a variable that may be
+`true`, `false` or `null`; for a plain null check either reads fine.
 
 ## 🔗 Relations & includes
 
@@ -522,11 +665,72 @@ await User.query()
     .getAll()
 ```
 
+An include's `where` also takes a ready `SQL` fragment, for everything an equality cannot say —
+expressions over JSON columns, casts, bracketed logic — or a list of either, ANDed together (see
+[Conditions built at runtime](#conditions-built-at-runtime)). It works the same in the
+`{ required: true }` branch, where the fragment lands inside the `WHERE EXISTS` sub-query:
+
+```ts
+await User.query()
+    .include({
+        model: Post,
+        where: sql`${Post.column('meta')}->>'source' = 'import'`,
+        required: true,
+    })
+    .getAll()
+```
+
+A whole query builder can be attached instead, with the same options:
+
+```ts
+await User.query()
+    .includeQueryable(Post.query().where({ status: 'draft' }), { as: 'drafts', required: true })
+    .getAll()
+```
+
+> [!WARNING]
+> `{ as }` on `.includeQueryable()` is what disambiguates a model with two relations to the same
+> target. Without it the **first declared** relation wins — the include attaches to `outgoingRules`
+> when you meant `incomingRules`, loads the wrong rows and says nothing. An `{ as }` naming no
+> relation now fails instead of building a branch the database will reject.
+
+### Filtering by a relation without loading it
+
+`{ required: true }` filters the parent by its children, but the condition it builds is applied
+straight to the query's WHERE — it cannot be ORed with anything, negated, or handed to a filter
+layer. `.existsRelation()` returns that same correlated fragment instead of applying it:
+
+```ts
+const query = Period.query()
+
+query.where(SqlConditions.anyOf([
+    query.existsRelation({ model: PlanPropertyData, where: { positionId: ids } }),
+    Op.is(true).build(query.column('isActive')),
+]))
+```
+
+```sql
+exists (select 1 from "plan_property_data"
+        where "plan_property_data"."period_id" = "period"."id"
+          and "plan_property_data"."position_id" in ($1, $2))
+   or "period"."is_active" is true
+```
+
+The table, the join columns and the soft-delete check come from the relation metadata, and the
+child conditions stay bound parameters — the alternative is writing the sub-query out as a string,
+which puts table and column names beyond the reach of any rename. The relation is addressed as in
+an include (target model, or `{ as }` when there are several to the same target), an empty `IN`
+list yields a condition matching nothing rather than a syntax error, and a self-referencing
+relation aliases its child so the correlation is not the row against itself.
+
+Many-to-many is refused: the link runs through a junction table, so there is no single foreign key
+to correlate on — address the junction relation instead.
+
 | Situation | Use |
 |---|---|
 | Two relations to the same model | `{ as: 'propertyName' }` on the include, `{ foreignKey }` on the relation ([below](#which-column-a-relation-uses)) |
 | Joining on something other than the primary key | `{ targetKey }` / `{ sourceKey }` on the relation ([below](#which-column-the-relation-lands-on)) |
-| Filter parents by their children | `{ required: true }` → `WHERE EXISTS (...)` |
+| Filter parents by their children | `{ required: true }` → `WHERE EXISTS (...)`, or `.existsRelation()` for the condition alone ([above](#filtering-by-a-relation-without-loading-it)) |
 | Many-to-many | `@BelongsToMany(() => Tag, { through: () => PostTag })` — the junction is traversed and flattened for you |
 | Conditional nesting | `.conditionalEndInclude(flag)` closes the sub-query only when `flag` is true |
 
@@ -645,6 +849,73 @@ row with itself.
 > A `targetKey` or `sourceKey` naming a column the model does not have fails `SchemaBuilder.build()`, naming
 > the relation and the model, exactly as an unknown `foreignKey` does.
 
+## 🧭 TableRef — correlated sub-queries from metadata
+
+`existsRelation` covers one shape: an `EXISTS` correlated on a single relation. `TableRef` is the
+general form — value, aggregate and freeform sub-queries, over one relation or a path of several —
+still built from model metadata, so table and column names stay reachable by the compiler instead
+of being typed out as strings.
+
+```ts
+import { TableRef } from '@iappx/drizzle-active-record'
+
+Author.ref()                          // a TableRef to Author's own table
+Author.ref({ as: 'a2' })              // ... aliased
+Author.ref({ recursive: true })       // ... the recursive twin, for use inside a CTE term
+TableRef.of(Author)                   // same as Author.ref()
+query.ref()                           // bound to a query's own effective table —
+                                       // the real table, or the twin on a RecursiveDBModelQuery
+```
+
+Every correlated method takes a `relation` (a property key, or a path of them for a multi-hop
+walk) and narrows with `where`, `orderBy` and `limit` exactly like `.where()`/`.orderBy()` do:
+
+```ts
+const author = Author.ref()
+
+author.existsRelation({ relation: 'books', where: { status: 'published' } })
+// exists (select 1 from "books" where "books"."author_id" = "authors"."id" and "books"."status" = $1)
+
+author.notExistsRelation({ relation: 'books' })                                    // negated
+author.valueOfRelation({ relation: 'books', column: 'title', orderBy: [['rating', 'DESC']] })
+// (select "title" from "books" where ... order by "books"."rating" desc limit $1) — always one row
+
+author.aggregateOfRelation({ relation: 'books', fn: 'count', cast: 'integer' })
+// (select count(*) from "books" where ...)::integer
+
+Book.ref().aggregate({ fn: 'avg', column: 'rating', where: { status: 'published' } })
+// (select avg("rating") from "books" where "books"."status" = $1) — this table, no relation walked
+
+author.selectFromRelation({
+    relation: 'books',
+    select: scope => sql`upper(${scope.ref.column('title')})`,
+})
+// the library resolves the path and the correlation; the caller supplies only what to select
+```
+
+**Multi-step paths.** Each entry joins to the one before it; a bare string addresses the relation
+by property key, the object form adds `{ as }` (for two relations to the same target) or a per-hop
+`where`. A table that repeats along the path — including the outer table itself — gets an
+auto-alias (`__exists`, `__exists2`, ...), the same suffix a self-referencing `existsRelation`
+already uses:
+
+```ts
+account.existsRelation({
+    relation: ['positions', { as: 'account' }],
+    where: scope => scope.ref.existsRelation({ relation: 'users', where: { isMain: true } }),
+})
+```
+
+`scope` (passed to a `where`/`select` callback) gives typed access to the walk: `scope.ref` is the
+last hop, `scope.column(key)` reads from it, `scope.hop(i)` reaches an intermediate step, and
+`scope.outer` is the `TableRef` the path started from.
+
+**`TableRef.wrap(table, meta?)`** wraps an already-built Drizzle table instead of a model — the
+`step` a recursive query's `.on()` callback receives as its third argument, for one. `.from` is the
+`FROM`/`JOIN` element (`"orig" "alias"` once aliased — a bare `Table` chunk dropped into a `sql`
+template renders only the current name, never the pair a `FROM` needs), and `.extra(name)` qualifies
+a name that belongs to no column, such as a depth counter carried down a recursion.
+
 ## ✍️ Writing data
 
 Reads go through the query builder; writes are Active Record methods on the model.
@@ -658,6 +929,7 @@ await TrainingProgram.bulkUpsert(rows, {
     updateKeys: ['title'],          // ... DO UPDATE SET title = excluded.title
     incrementKeys: ['viewsCount'],  // ... views_count = views_count + excluded.views_count
 })
+await TrainingProgram.update({ archivedAt: new Date() }, { where: { userId } })
 await TrainingProgram.destroy({ where: { userId } })
 const draft = TrainingProgram.build({ title })   // in-memory only, not saved
 
@@ -671,6 +943,29 @@ await program.destroy()
 ```
 
 An instance without a primary key value is `INSERT`ed by `save()`; with one, it is `UPDATE`d.
+
+`undefined` never reaches the `SET` clause — neither on an instance `update()` nor on the mass
+`Model.update()` / `query().update()`. A patch whose values are all `undefined` writes nothing at
+all, so an optional-field payload can be handed over as it arrived: only the keys that carry a
+value are written, and `null` still means "write NULL".
+
+Underneath the properties sits the raw store, which is also where computed columns from
+`select({ extras })` land — they are not model properties, so this is the only way to read them:
+
+```ts
+program.getDataValue('title')             // a column, or a computed extra
+program.setDataValue('title', 'renamed')  // writes and marks dirty — save() persists it
+program.dataValues                        // every stored value as a plain object
+TrainingProgram.primaryKeyAttribute       // 'id' — the property key of the primary key
+
+program.changed('title', true)            // mark dirty by hand
+program.changed('title', false)           // ... or clean, to skip it on the next save()
+```
+
+`setDataValue` marks the key changed exactly like assigning the property does, and reaches keys that
+have no property to assign — a computed extra. A primary key that already holds a value is left
+alone by both: `save()` reads the `WHERE` value out of the same store after the write, so changing it
+would build an `UPDATE ... SET id = $1 WHERE id = $1` that matches no row.
 
 ## 🔒 Transactions
 
@@ -728,6 +1023,71 @@ await query
 query.toSQL()   // { sql, params } — inspect without executing
 Orm.db          // the plain Drizzle instance, for anything the builder doesn't cover
 ```
+
+`query.column()` needs a query to exist first, which is the wrong order whenever the fragment is
+built **before** the chain it goes into — a shared expression, a condition assembled by a helper, an
+`extras` column reused in several queries. `Model.column()` is the same lookup without that:
+
+```ts
+const fullName = sql`${User.column('firstName')} || ' ' || ${User.column('lastName')}`
+
+await User.query()
+    .where(sql`${fullName} ilike ${'%' + term + '%'}`)
+    .select({ extras: { fullName: fullName.as('full_name') } })
+    .orderBy([[fullName, 'ASC']])
+    .getAll()
+```
+
+It takes a property key (the database column name works too) and throws naming the model and its
+known columns when neither matches — a typo would otherwise reach the database as `undefined`.
+
+## 🧮 SQL expressions — `Fn` and `PgExpr`
+
+Two helper classes cover the expressions Drizzle does not export as builders. Both return a plain
+`SQL`, so the result goes anywhere a column does — `where`, `select({ extras })`, `orderBy`,
+`groupBy`, a `TableRef` callback — and `Op.<operator>(value).build(expression)` turns an operator
+into a condition against one:
+
+```ts
+import { Fn, Op } from '@iappx/drizzle-active-record'
+
+const rating = Fn.coalesce(Book.column('rating'), 0)   // coalesce("books"."rating", $1)
+
+await Book.query()
+    .where(Op.gte(4).build(rating))
+    .orderBy([[rating, 'DESC']])
+    .select({ extras: { rating: rating.as('rating') } })
+    .getAll()
+```
+
+`Fn` is dialect-neutral and currently holds `coalesce(expr, ...fallbacks)`, whose fallbacks are bound
+as parameters. `PgExpr` is PostgreSQL-only:
+
+| Method | SQL |
+|---|---|
+| `PgExpr.jsonText(source, key)` | `<source> ->> <key>` — the member as `text` |
+| `PgExpr.jsonValue(source, key)` | `<source> -> <key>` — the member as `json`/`jsonb`, to keep traversing |
+| `PgExpr.cast(expr, type)` | `cast(<expr> as <type>)` |
+| `PgExpr.trunc(expr, scale)` | `trunc(<expr>, <scale>)` — the two-argument Postgres form |
+
+```ts
+import { Op, PgExpr } from '@iappx/drizzle-active-record'
+
+const meta = Author.column('meta')
+const tier = PgExpr.jsonText(meta, 'tier')                                    // "authors"."meta" ->> $1
+const score = PgExpr.cast(PgExpr.jsonText(meta, 'score'), 'double precision') // cast(... as double precision)
+
+await Author.query()
+    .where(Op.eq('gold').build(tier))
+    .where(Op.gt(4.5).build(score))
+    .orderBy([[PgExpr.trunc(score, 1), 'DESC']])
+    .getAll()
+```
+
+`cast` takes a closed list of target types — `text`, `varchar`, `numeric`, `double precision`,
+`float`, `int`, `bigint`, `boolean`, `date`, `timestamp`, `json`, `jsonb` — because the type name is
+rendered as a keyword rather than bound as a parameter. For anything outside it, write the `sql`
+fragment by hand.
 
 ## 🧱 Dialects
 

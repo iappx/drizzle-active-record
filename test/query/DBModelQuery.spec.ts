@@ -1,6 +1,6 @@
-import { Orm, ModelNotFoundError, Op, SchemaBuilder, SnakeCaseNamingStrategy } from '../../src'
+import { Orm, ModelNotFoundError, Op, SchemaBuilder, SnakeCaseNamingStrategy, SqlConditions } from '../../src'
 import { PgDialect } from 'drizzle-orm/pg-core'
-import { SQL, gt, sql } from 'drizzle-orm'
+import { SQL, asc, desc, gt, sql } from 'drizzle-orm'
 import { Author, Book, Review, SoftEntity, Tag } from '../fixtures/testModels'
 import { createMockDb, TMockDb } from '../fixtures/mockDb'
 
@@ -61,6 +61,52 @@ describe('where — plain-object semantics', () => {
     it('omits where from the config when there is no condition', async () => {
         await Author.query().getAll()
         expect(cfg().where).toBeUndefined()
+    })
+})
+
+describe('where — a list of conditions, or none', () => {
+    it('a list is AND-ed, mixing plain objects and raw SQL', async () => {
+        const table = (Author as any).meta.drizzleTable
+        await Author.query().where([{ name: 'x' }, gt(table.age, 18)]).getAll()
+        const q = sqlOf(cfg().where)
+        expect(q.sql.toLowerCase()).toContain('and')
+        expect(q.params).toEqual(['x', 18])
+    })
+
+    it('an empty list adds nothing', async () => {
+        await Author.query().where([]).getAll()
+        expect(cfg().where).toBeUndefined()
+    })
+
+    it('undefined adds nothing — the shape SqlConditions.allOf returns for an empty list', async () => {
+        await Author.query().where(SqlConditions.allOf([])).getAll()
+        expect(cfg().where).toBeUndefined()
+    })
+
+    it('undefined leaves the conditions already present untouched', async () => {
+        await Author.query().where({ name: 'x' }).where(undefined).getAll()
+        expect(sqlOf(cfg().where).params).toEqual(['x'])
+    })
+
+    it('orWhere takes the same shapes', async () => {
+        await Author.query().where({ name: 'x' }).orWhere([{ age: 5 }, { id: 1 }]).getAll()
+        const q = sqlOf(cfg().where)
+        expect(q.sql.toLowerCase()).toMatch(/\bor\b/)
+        expect(q.params).toEqual(['x', 5, 1])
+    })
+
+    it('orWhere with nothing to add keeps what came before as-is', async () => {
+        await Author.query().where({ name: 'x' }).orWhere([]).getAll()
+        const q = sqlOf(cfg().where)
+        expect(q.sql.toLowerCase()).not.toMatch(/\bor\b/)
+        expect(q.params).toEqual(['x'])
+    })
+
+    it('an include takes a list too', async () => {
+        const table = (Book as any).meta.drizzleTable
+        await Author.query().include({ model: Book, where: [{ title: 'T' }, gt(table.rating, 4)] }).getAll()
+        const branch = cfg().with.books
+        expect(sqlOf(branch.where).params).toEqual(['T', 4])
     })
 })
 
@@ -132,14 +178,14 @@ describe('orderBy', () => {
         expect(sqlOf(cfg().orderBy[0]).sql).toContain('created_at')
     })
 
-    it('skips a wrong model prefix', async () => {
-        await Author.query().orderBy([['OtherModel.created_at', 'DESC']]).getAll()
-        expect(cfg().orderBy).toBeUndefined()
+    it('throws on a wrong model prefix instead of silently dropping the sort', async () => {
+        expect(() => Author.query().orderBy([['OtherModel.created_at', 'DESC']]))
+            .toThrow(/Unknown orderBy column "OtherModel.created_at" on authors/)
     })
 
-    it('skips an unresolvable nested path (no broken ORDER BY)', async () => {
-        await Author.query().orderBy([['books.reviews.text', 'DESC']]).getAll()
-        expect(cfg().orderBy).toBeUndefined()
+    it('throws on an unresolvable nested path instead of silently dropping the sort', async () => {
+        expect(() => Author.query().orderBy([['books.reviews.text', 'DESC']]))
+            .toThrow(/Unknown orderBy column "books.reviews.text" on authors/)
     })
 
     it('accumulates multiple orderBy entries', async () => {
@@ -212,12 +258,16 @@ describe('include (raw style)', () => {
         await Author.query().include([{ model: Book }]).getAll()
         expect(Object.keys(cfg().with)).toContain('books')
     })
+
+    it('accepts a bare model class in a nested include too', async () => {
+        await Author.query().include({ model: Book, include: [Review] }).getAll()
+        expect(Object.keys(cfg().with.books.with)).toContain('reviews')
+    })
 })
 
 describe('includeModel — belongsToMany (m2m via junction)', () => {
     it('expands the m2m into a junction -> target nested "with"', async () => {
         await Author.query().includeModel(Tag).endInclude().getAll()
-        // связь идёт через junction (author_tags), а её ключ 'tags' содержит вложенную связь на цель
         expect(Object.keys(cfg().with)).toContain('tags')
         expect(Object.keys(cfg().with.tags.with)).toContain('tag')
     })
@@ -307,6 +357,37 @@ describe('delete', () => {
     })
 })
 
+describe('update', () => {
+    it('sets the values on every row the where matches', async () => {
+        await Author.query().where({ id: 1 }).update({ name: 'B' })
+        expect(mock.calls.update).toHaveBeenCalledTimes(1)
+        expect(mock.calls.set).toHaveBeenCalledWith({ name: 'B' })
+        expect(sqlOf(mock.calls.updateWhere.mock.calls[0][0]).sql).toContain('"id"')
+    })
+
+    it('updates the whole table when no filter was set', async () => {
+        await Author.query().update({ name: 'B' })
+        expect(mock.calls.updateWhere).toHaveBeenCalledWith(undefined)
+    })
+
+    it('drops undefined keys from the SET clause', async () => {
+        await Author.query().where({ id: 1 }).update({ name: 'B', age: undefined })
+        // toStrictEqual, not toHaveBeenCalledWith: the latter treats { age: undefined } as absent
+        expect(mock.calls.set.mock.calls[0][0]).toStrictEqual({ name: 'B' })
+    })
+
+    it('issues no query when every value is undefined', async () => {
+        await Author.query().where({ id: 1 }).update({ name: undefined })
+        expect(mock.calls.update).not.toHaveBeenCalled()
+    })
+
+    it('routes execution through conn(tx)', async () => {
+        const tx = { __tx: true } as any
+        await Author.query().where({ id: 1 }).transaction(tx).update({ name: 'B' })
+        expect(connSpy.mock.calls[0][0]).toBe(tx)
+    })
+})
+
 describe('transaction', () => {
     it('routes execution through conn(tx)', async () => {
         const tx = { __tx: true } as any
@@ -347,11 +428,166 @@ describe('select — object and extras forms', () => {
     })
 })
 
+describe('orderBy — array form', () => {
+    const orderText = (i = 0) => sqlOf(cfg().orderBy[i]).sql.toLowerCase()
+
+    it('pairs of column name and direction still work', async () => {
+        await Author.query().orderBy([['name', 'DESC'], ['age', 'ASC']]).getAll()
+        expect(cfg().orderBy).toHaveLength(2)
+        expect(orderText(0)).toContain('desc')
+        expect(orderText(1)).toContain('asc')
+    })
+
+    it('a SQL expression may stand in the column position of a pair', async () => {
+        const table = (Author as any).meta.drizzleTable
+        await Author.query().orderBy([[sql`lower(${table.name})`, 'DESC']]).getAll()
+        expect(cfg().orderBy).toHaveLength(1)
+        expect(orderText()).toContain('lower(')
+        expect(orderText()).toContain('desc')
+    })
+
+    it('a SQL expression without a direction defaults to ascending', async () => {
+        const table = (Author as any).meta.drizzleTable
+        await Author.query().orderBy([[sql`lower(${table.name})`]]).getAll()
+        expect(orderText()).toContain('asc')
+    })
+
+    it('mixes SQL expressions and column names in one call', async () => {
+        const table = (Author as any).meta.drizzleTable
+        await Author.query().orderBy([[sql`lower(${table.name})`, 'DESC'], ['age', 'ASC']]).getAll()
+        expect(cfg().orderBy).toHaveLength(2)
+        expect(orderText(0)).toContain('lower(')
+        expect(orderText(1)).toContain('asc')
+    })
+})
+
+describe('orderBy — a list of items, or none', () => {
+    const orderText = (i = 0) => sqlOf(cfg().orderBy[i]).sql.toLowerCase()
+
+    it('takes a list of ready SQL expressions — the shape a sorting layer returns', async () => {
+        const table = (Author as any).meta.drizzleTable
+        await Author.query().orderBy([desc(table.name), asc(table.age)]).getAll()
+        expect(cfg().orderBy).toHaveLength(2)
+        expect(orderText(0)).toContain('desc')
+        expect(orderText(1)).toContain('asc')
+    })
+
+    it('takes a list of bare column names, each ascending', async () => {
+        await Author.query().orderBy(['name', 'age']).getAll()
+        expect(cfg().orderBy).toHaveLength(2)
+        expect(orderText(0)).toContain('asc')
+        expect(orderText(1)).toContain('asc')
+    })
+
+    it('mixes expressions, column names and pairs in one list', async () => {
+        const table = (Author as any).meta.drizzleTable
+        await Author.query().orderBy([desc(table.name), 'age', ['created_at', 'DESC']]).getAll()
+        expect(cfg().orderBy).toHaveLength(3)
+        expect(orderText(0)).toContain('desc')
+        expect(orderText(1)).toContain('asc')
+        expect(orderText(2)).toContain('created_at')
+    })
+
+    it('a nested list of pairs is flattened, so an already-built list goes in as one entry', async () => {
+        await Author.query().orderBy([[['name', 'DESC'], ['age', 'ASC']]]).getAll()
+        expect(cfg().orderBy).toHaveLength(2)
+        expect(orderText(0)).toContain('desc')
+        expect(orderText(1)).toContain('asc')
+    })
+
+    it('an empty list adds no ordering', async () => {
+        await Author.query().orderBy([]).getAll()
+        expect(cfg().orderBy).toBeUndefined()
+    })
+
+    it('undefined adds no ordering', async () => {
+        await Author.query().orderBy(undefined).getAll()
+        expect(cfg().orderBy).toBeUndefined()
+    })
+
+    it('an unknown column in a list still throws, naming it', () => {
+        expect(() => Author.query().orderBy(['name', 'nope']))
+            .toThrow(/Unknown orderBy column "nope" on authors/)
+    })
+})
+
+describe('orderBy — invalid input fails clearly instead of throwing a TypeError', () => {
+    it('rejects a list entry that is neither a column, an expression nor a pair', () => {
+        expect(() => Author.query().orderBy([42] as any))
+            .toThrow(/Invalid orderBy item on authors/)
+    })
+
+    it('rejects a pair whose column is neither a name nor a SQL expression', () => {
+        expect(() => Author.query().orderBy([[42, 'ASC']] as any))
+            .toThrow(/expected a column name or a SQL expression/)
+    })
+
+    it('rejects an argument that is neither a column, a SQL expression nor an array', () => {
+        expect(() => Author.query().orderBy(42 as any)).toThrow(/Invalid orderBy argument on authors/)
+    })
+
+    it('names the model in the message', () => {
+        expect(() => Author.query().orderBy({} as any)).toThrow(/on authors/)
+    })
+})
+
+describe('orderBy — a bare column name sorts ascending', () => {
+    it('a column name without a direction sorts ascending', async () => {
+        await Author.query().orderBy('name').getAll()
+        expect(cfg().orderBy).toHaveLength(1)
+        expect(sqlOf(cfg().orderBy[0]).sql.toLowerCase()).toContain('asc')
+    })
+
+    it('an explicit DESC still works (regression)', async () => {
+        await Author.query().orderBy('name', 'DESC').getAll()
+        expect(sqlOf(cfg().orderBy[0]).sql.toLowerCase()).toContain('desc')
+    })
+
+    it('an explicit ASC still works (regression)', async () => {
+        await Author.query().orderBy('name', 'ASC').getAll()
+        expect(sqlOf(cfg().orderBy[0]).sql.toLowerCase()).toContain('asc')
+    })
+
+    it('a pair without a direction still sorts ascending (regression)', async () => {
+        await Author.query().orderBy([['name']]).getAll()
+        expect(sqlOf(cfg().orderBy[0]).sql.toLowerCase()).toContain('asc')
+    })
+
+    it('an unknown column name throws instead of being silently dropped', () => {
+        expect(() => Author.query().orderBy('nope', 'ASC'))
+            .toThrow(/Unknown orderBy column "nope" on authors/)
+    })
+
+    it('an unknown column name with no direction also throws', () => {
+        expect(() => Author.query().orderBy('nope'))
+            .toThrow(/Unknown orderBy column "nope" on authors/)
+    })
+
+    it('a nullish argument is still silently ignored', async () => {
+        await Author.query().orderBy(undefined as any).orderBy(null as any).getAll()
+        expect(cfg().orderBy).toBeUndefined()
+    })
+})
+
 describe('orderBy — raw SQL passthrough', () => {
     it('accepts a raw drizzle SQL order expression', async () => {
         const table = (Author as any).meta.drizzleTable
         await Author.query().orderBy(sql`${table.name} desc`).getAll()
         expect(cfg().orderBy).toHaveLength(1)
+    })
+
+    it('applies a direction given alongside a raw SQL expression', async () => {
+        const table = (Author as any).meta.drizzleTable
+        await Author.query().orderBy(sql`${table.name}`, 'DESC').getAll()
+        expect(sqlOf(cfg().orderBy[0]).sql).toMatch(/desc$/i)
+    })
+
+    it('the expression form and the [expr, direction] pair form agree', async () => {
+        const table = (Author as any).meta.drizzleTable
+        await Author.query().orderBy(sql`${table.name}`, 'DESC').getAll()
+        const fromArgs = sqlOf(cfg().orderBy[0]).sql
+        await Author.query().orderBy([[sql`${table.name}`, 'DESC']]).getAll()
+        expect(sqlOf(cfg().orderBy[0]).sql).toBe(fromArgs)
     })
 })
 
@@ -385,11 +621,9 @@ describe('include — as / nested / errors', () => {
         expect(() => Author.query().include({ as: 'nope' })).toThrow(/nope/)
     })
 
-    it('required: true adds a WHERE EXISTS filter on the parent (INNER JOIN semantics)', async () => {
+    it('required: true keeps the include and filters the parent with EXISTS (INNER JOIN semantics)', async () => {
         await Author.query().include({ model: Book, where: { title: 'X' }, required: true }).getAll()
-        // relation still included (LEFT JOIN for data) ...
         expect(Object.keys(cfg().with)).toContain('books')
-        // ... plus an EXISTS condition pushed onto the parent WHERE
         expect(cfg().where).toBeDefined()
     })
 

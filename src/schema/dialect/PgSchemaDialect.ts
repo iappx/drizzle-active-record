@@ -11,7 +11,6 @@ import {
     smallint,
     text,
     time,
-    timestamp,
     uuid,
     varchar,
 } from 'drizzle-orm/pg-core'
@@ -19,18 +18,63 @@ import type { Table as TDrizzleTable } from 'drizzle-orm'
 import { ISchemaDialect, TColumnBuilder } from './ISchemaDialect'
 import { TColumnMeta, TDbDataType } from '../../types/metadata'
 
-// a column whose database type the driver passes through untouched (ltree, citext, inet, ...)
 const passThrough = (sqlType: string) => customType<{ data: string; driverData: string }>({
     dataType: () => sqlType,
 })
 
+// drizzle's own `timestamp({ mode: 'date' })` calls `value.toISOString()`, which throws while the
+// statement is built for a string or an epoch number; a value that parses to none is passed through
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const timestampValue = customType<{ data: Date; driverData: any }>({
+    dataType: () => 'timestamp with time zone',
+    toDriver: (value: unknown): unknown => {
+        if (value instanceof Date) {
+            return value.toISOString()
+        }
+        if (typeof value === 'number' || typeof value === 'string') {
+            const parsed = new Date(value)
+            return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString()
+        }
+        return value
+    },
+    // the driver hands back a Date when node-postgres parses the type itself and a string when it
+    // does not; both have to end up as a Date, because that is what the date kind promises
+    fromDriver: (value: unknown): Date => (value instanceof Date ? value : new Date(value as string)),
+})
+
+/**
+ * The PostgreSQL schema dialect: builds `pgTable`s and `pg-core` column builders from model metadata.
+ *
+ * It is the dialect `SchemaBuilder` uses unless another one is installed with
+ * `SchemaBuilder.setDialect(...)`.
+ *
+ * @example
+ * ```ts
+ * SchemaBuilder.setDialect(new PgSchemaDialect())
+ * SchemaBuilder.build()
+ * ```
+ */
 export class PgSchemaDialect implements ISchemaDialect {
+    /** Length given to a `STRING` column that declares no size. */
     public static readonly DefaultStringLength = 255
 
+    /**
+     * Builds the `pgTable` for a model.
+     *
+     * @param columns Builders keyed by property key, as returned by {@link PgSchemaDialect.mapColumn}
+     */
     public createTable(tableName: string, columns: Record<string, TColumnBuilder>): TDrizzleTable {
         return pgTable(tableName, columns) as unknown as TDrizzleTable
     }
 
+    /**
+     * Builds the `pg-core` column builder for a column, from its declared data type.
+     *
+     * A `DATE` column accepts a `Date`, an ISO or SQL string and an epoch number, and always reads
+     * back as a `Date`. An `ARRAY` without an item type and a `CUSTOM` without a database type throw.
+     *
+     * @throws {Error} When the data type is `array` without `itemType`, or `custom` without `sqlType`
+     */
     public mapColumn(column: TColumnMeta): TColumnBuilder {
         // resolved by SchemaBuilder (explicit name or naming strategy) before the dialect sees it
         const name = column.columnName as string
@@ -44,14 +88,11 @@ export class PgSchemaDialect implements ISchemaDialect {
             case 'smallint':
                 return smallint(name)
             case 'bigint':
-                // 'bigint' reads back a JS BigInt; every other value keeps the default JS number
                 return bigint(name, { mode: dataType.mode === 'bigint' ? 'bigint' : 'number' })
             case 'float':
             case 'double':
                 return doublePrecision(name)
             case 'decimal':
-                // read back as a JS number by default: application code does arithmetic on these.
-                // DataType.DECIMAL(p, s, { mode: 'string' }) keeps the value exact instead
                 return numeric(name, {
                     precision: dataType.precision,
                     scale: dataType.scale,
@@ -60,7 +101,7 @@ export class PgSchemaDialect implements ISchemaDialect {
             case 'boolean':
                 return boolean(name)
             case 'date':
-                return timestamp(name, { withTimezone: true, mode: 'date' })
+                return timestampValue(name)
             case 'time':
                 return time(name)
             case 'uuid':

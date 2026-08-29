@@ -1,9 +1,10 @@
-import { integer, pgTable, PgDialect, text } from 'drizzle-orm/pg-core'
+import { boolean, integer, pgTable, PgDialect, text } from 'drizzle-orm/pg-core'
 import { Op } from '../../src'
 
 const t = pgTable('t', {
     id: integer('id'),
     name: text('name'),
+    flag: boolean('flag'),
 })
 
 const dialect = new PgDialect()
@@ -80,6 +81,45 @@ describe('Op — null', () => {
 
     it('isNotNull -> "is not null"', () => {
         expect(text_(Op.isNotNull(), t.id)).toContain('is not null')
+    })
+})
+
+describe('Op — three-valued IS', () => {
+    it('is(true) / is(false) -> "is true" / "is false"', () => {
+        expect(text_(Op.is(true), t.flag)).toContain('is true')
+        expect(text_(Op.is(false), t.flag)).toContain('is false')
+    })
+
+    it('isNot(true) / isNot(false) -> "is not true" / "is not false"', () => {
+        expect(text_(Op.isNot(true), t.flag)).toContain('is not true')
+        expect(text_(Op.isNot(false), t.flag)).toContain('is not false')
+    })
+
+    it('is(null) / isNot(null) -> "is null" / "is not null"', () => {
+        expect(text_(Op.is(null), t.flag)).toContain('is null')
+        expect(text_(Op.isNot(null), t.flag)).toContain('is not null')
+    })
+
+    it('agrees with isNull / isNotNull for the null case', () => {
+        expect(text_(Op.is(null), t.flag)).toBe(text_(Op.isNull(), t.flag))
+        expect(text_(Op.isNot(null), t.flag)).toBe(text_(Op.isNotNull(), t.flag))
+    })
+
+    it('the keyword is inlined, never bound as a parameter', () => {
+        // `x is $1` is a syntax error in postgres
+        expect(compile(Op.is(true), t.flag).params).toEqual([])
+        expect(compile(Op.isNot(false), t.flag).params).toEqual([])
+    })
+
+    it('isNot(true) is not the same predicate as ne(true) — the NULL-row trap', () => {
+        expect(text_(Op.isNot(true), t.flag)).toContain('is not true')
+        expect(text_(Op.ne(true), t.flag)).toContain('<>')
+        expect(text_(Op.isNot(true), t.flag)).not.toContain('<>')
+    })
+
+    it('rejects a non-boolean, non-null value instead of emitting broken SQL', () => {
+        expect(() => Op.is(1 as never).build(t.flag)).toThrow(/true, false or null/)
+        expect(() => Op.isNot('yes' as never).build(t.flag)).toThrow(/true, false or null/)
     })
 })
 

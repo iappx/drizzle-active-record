@@ -1,13 +1,7 @@
 import { PgDialect } from 'drizzle-orm/pg-core'
 
-/**
- * Chainable stub for the drizzle `db` object so BaseModel/DBModelQuery can be
- * exercised without a real Postgres connection. Records the arguments passed to
- * each terminal call and lets tests control returned rows.
- */
 export type TMockDb = {
     db: any
-    /** captured config of the last query[table].findMany / findFirst, and of the last flat select */
     captured: {
         cfg?: any
         selection?: any
@@ -35,17 +29,11 @@ export type TMockDb = {
         select: jest.Mock
         execute: jest.Mock
     }
-    /** rows returned by insert/update .returning() */
     returningRows: unknown[]
-    /** rows returned by query.findMany */
     findManyRows: unknown[]
-    /** row returned by query.findFirst */
     findFirstRow: unknown
-    /** count returned by $count */
     countValue: number
-    /** rows returned by awaiting a flat select chain */
     selectRows: unknown[]
-    /** rows returned by db.execute() */
     executeRows: unknown[]
 }
 

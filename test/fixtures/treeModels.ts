@@ -2,7 +2,6 @@ import { BelongsTo, DataType, ForeignKey, HasMany, NamedColumn, QueryableModel, 
 
 export type TCategoryCA = { title: string; parentId?: number }
 
-/** Self-referencing model: the shape a recursive query walks. */
 @Table('categories')
 export class Category extends QueryableModel<Category, TCategoryCA> {
     @NamedColumn(DataType.BIGINT, 'id', { primaryKey: true, autoIncrement: true })

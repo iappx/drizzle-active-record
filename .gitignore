@@ -40,3 +40,4 @@ lerna-debug.log*
 #packages
 package-lock.json
 yarn.lock
+.omc

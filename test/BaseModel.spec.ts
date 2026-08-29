@@ -159,6 +159,35 @@ describe('update(patch)', () => {
     })
 })
 
+describe('update(patch) — undefined values', () => {
+    it('issues no query when every patched value is undefined', async () => {
+        const a = Author.hydrate({ id: 1, name: 'A', age: 1 }) as Author
+
+        await expect(a.update({ name: undefined, age: undefined } as any)).resolves.toBe(a)
+
+        // drizzle's set() ignores undefined keys and throws "No values to set" on an empty object
+        expect(mock.calls.update).not.toHaveBeenCalled()
+        expect(a.changed()).toBe(false)
+    })
+
+    it('writes the defined values and drops the undefined ones', async () => {
+        const a = Author.hydrate({ id: 1, name: 'A', age: 1 }) as Author
+
+        await a.update({ name: 'B', age: undefined } as any)
+
+        // toStrictEqual, not toHaveBeenCalledWith: the latter treats { age: undefined } as absent
+        expect(mock.calls.set.mock.calls[0][0]).toStrictEqual({ name: 'B' })
+    })
+
+    it('still writes null — only undefined means "not provided"', async () => {
+        const a = Author.hydrate({ id: 1, name: 'A' }) as Author
+
+        await a.update({ name: null } as any)
+
+        expect(mock.calls.set).toHaveBeenCalledWith({ name: null })
+    })
+})
+
 describe('destroy()', () => {
     it('issues a DELETE for a non-paranoid model', async () => {
         const a = Author.hydrate({ id: 5, name: 'A' }) as Author
@@ -196,11 +225,38 @@ describe('reload()', () => {
 })
 
 describe('dataValue helpers', () => {
-    it('setDataValue writes without marking dirty; getDataValue reads', () => {
+    it('setDataValue writes and marks dirty; getDataValue reads', () => {
         const a = Author.hydrate({ id: 1, name: 'A' }) as Author
         a.setDataValue('name', 'Raw')
         expect(a.getDataValue('name')).toBe('Raw')
+        expect(a.name).toBe('Raw')
+        expect(a.changed()).toEqual(['name'])
+    })
+
+    it('save() writes a value set through setDataValue', async () => {
+        mock.returningRows = [{ id: 1, name: 'Raw' }]
+        const a = Author.hydrate({ id: 1, name: 'A' }) as Author
+        a.setDataValue('name', 'Raw')
+        await a.save()
+        expect(mock.calls.set).toHaveBeenCalledWith({ name: 'Raw' })
+    })
+
+    it('a hydrated instance is clean, so setDataValue is what makes it dirty', () => {
+        const a = Author.hydrate({ id: 1, name: 'A' }) as Author
         expect(a.changed()).toBe(false)
+    })
+
+    it('setDataValue leaves a populated primary key alone, exactly as an assignment does', () => {
+        const a = Author.hydrate({ id: 1, name: 'A' }) as Author
+        a.setDataValue('id', 99)
+        expect(a.id).toBe(1)
+        expect(a.changed()).toBe(false)
+    })
+
+    it('setDataValue seeds a primary key that has no value yet', () => {
+        const a = new Author()
+        a.setDataValue('id', 7)
+        expect(a.id).toBe(7)
     })
 })
 
@@ -231,6 +287,19 @@ describe('static create / bulkCreate / destroy', () => {
     it('static destroy deletes by where', async () => {
         await Author.destroy({ where: { id: [1, 2, 3] } })
         expect(mock.calls.delete).toHaveBeenCalledTimes(1)
+    })
+
+    it('static update writes the values to every matching row', async () => {
+        await Author.update({ age: 0 }, { where: { id: [1, 2, 3] } })
+        expect(mock.calls.update).toHaveBeenCalledTimes(1)
+        expect(mock.calls.set).toHaveBeenCalledWith({ age: 0 })
+        expect(mock.calls.updateWhere.mock.calls[0][0]).toBeDefined()
+    })
+
+    it('static update forwards the transaction to conn()', async () => {
+        const tx = { __tx: true } as any
+        await Author.update({ age: 1 }, { where: { id: 1 }, transaction: tx })
+        expect(connSpy.mock.calls[0][0]).toBe(tx)
     })
 
     it('bulkCreate forwards the transaction to conn()', async () => {
@@ -318,7 +387,6 @@ describe('timestamp roles & schema wiring', () => {
 })
 
 describe('static bulkUpsert', () => {
-    // рендерим drizzle-SQL в строку, чтобы точно проверять excluded/инкремент-выражения
     const renderSql = (chunk: unknown): string => new PgDialect().sqlToQuery(chunk as any).sql
 
     const upsertArg = (): { target: unknown[]; set: Record<string, unknown> } =>

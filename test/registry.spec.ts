@@ -46,7 +46,7 @@ describe('@Table', () => {
 })
 
 describe('@CreatedColumn / @UpdatedColumn / @DeletedColumn', () => {
-    it('flags the column beneath it and records the role key in meta', () => {
+    it('flags the column beneath it, without duplicating it, and records the role key in meta', () => {
         @Table({ tableName: 'ts_test', paranoid: true })
         class TsTest extends QueryableModel<TsTest, { v: string }> {
             @NamedColumn(DataType.BIGINT, 'id', { primaryKey: true })
@@ -68,7 +68,6 @@ describe('@CreatedColumn / @UpdatedColumn / @DeletedColumn', () => {
         expect(meta.createdAtKey).toBe('createdAt')
         expect(meta.updatedAtKey).toBe('updatedAt')
         expect(meta.deletedAtKey).toBe('deletedAt')
-        // роль проставлена на ту же колонку, что объявил @NamedColumn (не дубль)
         expect(meta.columns.filter(c => c.propertyKey === 'createdAt')).toHaveLength(1)
         expect(meta.columns.find(c => c.propertyKey === 'createdAt')?.role).toBe('createdAt')
     })
@@ -106,7 +105,7 @@ describe('@NamedColumn', () => {
 })
 
 describe('@ForeignKey', () => {
-    it('sets foreignKeyTarget on the matching column', () => {
+    it('records the target on the matching column', () => {
         class FkTarget {}
         @Table('fk_a')
         class FkA extends QueryableModel<FkA, { targetId: number }> {
@@ -118,7 +117,26 @@ describe('@ForeignKey', () => {
             targetId: number
         }
         const col = ModelRegistry.require(FkA).columns.find(c => c.propertyKey === 'targetId')
-        expect(col?.foreignKeyTarget?.()).toBe(FkTarget)
+        expect(col?.foreignKeyTargets?.map(target => target())).toEqual([FkTarget])
+    })
+
+    it('collects every target when one column is a foreign key to several models', () => {
+        class FkTargetA {}
+        class FkTargetB {}
+        @Table('fk_c')
+        class FkC extends QueryableModel<FkC, { targetId: number }> {
+            @NamedColumn(DataType.BIGINT, 'id', { primaryKey: true })
+            id: number
+
+            @ForeignKey(() => FkTargetA)
+            @ForeignKey(() => FkTargetB)
+            @NamedColumn(DataType.BIGINT, 'target_id')
+            targetId: number
+        }
+        const col = ModelRegistry.require(FkC).columns.find(c => c.propertyKey === 'targetId')
+        expect(col?.foreignKeyTargets?.map(target => target())).toEqual(
+            expect.arrayContaining([FkTargetA, FkTargetB]),
+        )
     })
 
     it('creates a fallback column when @ForeignKey has no @NamedColumn beneath it', () => {
@@ -135,7 +153,7 @@ describe('@ForeignKey', () => {
         const col = ModelRegistry.require(FkB).columns.find(c => c.propertyKey === 'loneFk')
         expect(col).toBeDefined()
         expect(col?.columnName).toBeUndefined()
-        expect(col?.foreignKeyTarget?.()).toBe(FkTarget2)
+        expect(col?.foreignKeyTargets?.map(target => target())).toEqual([FkTarget2])
     })
 })
 

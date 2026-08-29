@@ -1,5 +1,7 @@
+import { eq, SQL } from 'drizzle-orm'
 import { TColumnMeta, TRelationMeta, TTableMeta } from '../types/metadata'
 
+/** Where {@link RelationForeignKey.resolve} looks for the column carrying a relation's foreign key. */
 export type TForeignKeyLookup = {
     /** model the foreign key column lives on */
     ownerMeta: TTableMeta
@@ -14,6 +16,7 @@ export type TForeignKeyLookup = {
     optionName?: string
 }
 
+/** Where {@link RelationForeignKey.resolveReferencedKey} looks for the column a foreign key points at. */
 export type TReferencedKeyLookup = {
     /** model the column on the far side of the join lives on */
     ownerMeta: TTableMeta
@@ -29,10 +32,9 @@ export type TReferencedKeyLookup = {
 /**
  * Resolves which column carries the foreign key of a relation.
  *
- * Without an explicit key the single column referencing the other model is used. Two or more
- * such columns (`sourceWalletTypeId` / `targetWalletTypeId`, `parentId` / `sponsorId`, ...)
- * used to resolve to whichever was declared first, silently loading the wrong rows for every
- * relation but one — that case now fails when the schema is built.
+ * Without an explicit key the single column referencing the other model is used. Two or more such
+ * columns (`sourceWalletTypeId` / `targetWalletTypeId`, `parentId` / `sponsorId`, ...) are
+ * ambiguous, and fail when the schema is built.
  */
 export class RelationForeignKey {
     /** Strict lookup: throws on an unknown key and on an unresolvable ambiguity. */
@@ -68,9 +70,9 @@ export class RelationForeignKey {
     /**
      * The property key on the *other* side of the join — the column the foreign key points at.
      *
-     * Without `targetKey` / `sourceKey` this is the primary key of that model, which is what a
-     * relation used to be able to say. Naming a plain column instead is how a relation joins on
-     * shared field values (every row with the same `accountId`) or on a natural key (`guid`).
+     * Without `targetKey` / `sourceKey` this is the primary key of that model. Naming a plain column
+     * instead is how a relation joins on shared field values (every row with the same `accountId`)
+     * or on a natural key (`guid`).
      *
      * Strict: an unknown key fails when the schema is built.
      */
@@ -98,7 +100,6 @@ export class RelationForeignKey {
         return (explicitKey ? this.byKey(ownerMeta, explicitKey)?.propertyKey : undefined) ?? ownerMeta.primaryKey
     }
 
-    /** Which option names the far side of the join, by relation kind. */
     private static referencedOptionName(rel: TRelationMeta): string {
         return rel.kind === 'belongsTo' ? 'targetKey' : 'sourceKey'
     }
@@ -113,6 +114,31 @@ export class RelationForeignKey {
             return this.byKey(ownerMeta, explicitKey)
         }
         return this.candidates(ownerMeta, referencedCtor)[0]
+    }
+
+    /**
+     * The `eq(...)` condition correlating a child row to its parent along a relation.
+     *
+     * The tables are taken as given — real, a recursive twin, or aliased — and only which side
+     * carries the foreign key follows the relation kind. Returns `undefined` when the relation has
+     * no resolvable foreign key column, exactly like {@link find}.
+     */
+    public static linkCondition(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        parentTable: any,
+        parentMeta: TTableMeta,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        childTable: any,
+        childMeta: TTableMeta,
+        rel: TRelationMeta,
+    ): SQL | undefined {
+        if (rel.kind === 'hasMany' || rel.kind === 'belongsToMany') {
+            // the foreign key lives on the child and points back at the parent
+            const fkCol = this.find(childMeta, parentMeta.modelCtor, rel.foreignKey)
+            return fkCol ? eq(childTable[fkCol.propertyKey], parentTable[this.findReferencedKey(parentMeta, rel)]) : undefined
+        }
+        const fkCol = this.find(parentMeta, childMeta.modelCtor, rel.foreignKey)
+        return fkCol ? eq(childTable[this.findReferencedKey(childMeta, rel)], parentTable[fkCol.propertyKey]) : undefined
     }
 
     /**
@@ -142,7 +168,7 @@ export class RelationForeignKey {
     }
 
     private static candidates(ownerMeta: TTableMeta, referencedCtor: Function): TColumnMeta[] {
-        return ownerMeta.columns.filter(c => c.foreignKeyTarget && c.foreignKeyTarget() === referencedCtor)
+        return ownerMeta.columns.filter(c => c.foreignKeyTargets?.some(target => target() === referencedCtor))
     }
 
     private static label(meta: TTableMeta, rel: TRelationMeta): string {

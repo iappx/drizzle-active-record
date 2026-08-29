@@ -87,10 +87,9 @@ describe('belongsToMany through a junction that references one model twice', () 
         expect(person.friends.map(f => f.name)).toEqual(['Ada'])
     })
 
-    it('picks the junction relation by column, not by declaration order', () => {
+    it('picks the junction relation by column name, property or database, not by declaration order', () => {
         expect(RelationForeignKey.junctionRelation(Friendship.meta, Person, 'friendId')?.propertyKey).toBe('friend')
         expect(RelationForeignKey.junctionRelation(Friendship.meta, Person, 'personId')?.propertyKey).toBe('person')
-        // the database column name resolves to the same relation
         expect(RelationForeignKey.junctionRelation(Friendship.meta, Person, 'friend_id')?.propertyKey).toBe('friend')
     })
 })

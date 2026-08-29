@@ -13,15 +13,6 @@ import {
 } from '../../src'
 import { QueryableModel } from '../../src'
 
-/**
- * Shared fixture model graph covering every relation kind and data type used by
- * the ORM layer:
- *   Author (1) ── (N) Book (N) ── (1) Author
- *   Book   (1) ── (N) Review
- *   Author (N) ── (N) Tag  (through AuthorTag)
- *   SoftEntity — paranoid model (soft delete)
- */
-
 export type TAuthorCA = { name: string; age?: number }
 
 @Table('authors')
@@ -158,10 +149,6 @@ export class SoftEntity extends QueryableModel<SoftEntity, TSoftCA> {
     deletedAt: Date
 }
 
-/**
- * Profile covers: DataType.JSON, an explicit not-null column, and a HasOne
- * relation (belongsTo-kind without an FK column on this side).
- */
 @Table('profiles')
 export class Profile extends QueryableModel<Profile, { bio: string }> {
     @NamedColumn(DataType.BIGINT, 'id', { primaryKey: true, autoIncrement: true })

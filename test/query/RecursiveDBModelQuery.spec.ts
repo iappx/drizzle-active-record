@@ -1,4 +1,4 @@
-import { Orm, SchemaBuilder, SnakeCaseNamingStrategy } from '../../src'
+import { Orm, SchemaBuilder, SnakeCaseNamingStrategy, TableRef } from '../../src'
 import { and, eq, lt, SQL, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/node-postgres'
 import { Pool } from 'pg'
@@ -87,6 +87,63 @@ describe('statement shape', () => {
             .on(sql`"categories__recursive"."id" = "categories"."parent_id"`)
 
         expect(query.toSQL().sql).toContain('"categories__recursive"."id" = "categories"."parent_id"')
+    })
+})
+
+describe('a where() on the step term', () => {
+    it('renders from ... inner join ... where ..., not where before the join (Postgres 42601)', () => {
+        const text = Category.recursiveQuery()
+            .anchor(Category.query().where({ parentId: null }))
+            .step(Category.query().where({ title: 'active' }))
+            .on((cte, step) => eq(cte.id, step.parentId))
+            .toSQL().sql.toLowerCase()
+
+        const fromIdx = text.lastIndexOf('from "categories"')
+        const joinIdx = text.indexOf('inner join "categories__recursive" on', fromIdx)
+        const whereIdx = text.indexOf('where', fromIdx)
+
+        expect(fromIdx).toBeGreaterThan(-1)
+        expect(joinIdx).toBeGreaterThan(fromIdx)
+        expect(whereIdx).toBeGreaterThan(joinIdx)
+    })
+
+    it('keeps the on() join condition and the step\'s own where() condition in their own clauses', () => {
+        const { sql: text, params } = Category.recursiveQuery()
+            .anchor(Category.query().where({ parentId: null }))
+            .step(Category.query().where({ title: 'active' }))
+            .on((cte, step) => eq(cte.id, step.parentId))
+            .toSQL()
+
+        const lower = text.toLowerCase()
+        expect(lower).toContain('inner join "categories__recursive" on "categories__recursive"."id" = "categories"."parent_id"')
+        const whereClause = lower.slice(lower.lastIndexOf('where'))
+        expect(whereClause).toContain('"categories"."title"')
+        expect(params).toContain('active')
+    })
+
+    it('a step term without where() still renders the same statement as before', () => {
+        const text = tree().toSQL().sql.toLowerCase()
+
+        expect(text).toContain('from "categories" inner join "categories__recursive" on')
+    })
+
+    it('combines with order by and limit set on the step term', () => {
+        const text = Category.recursiveQuery()
+            .anchor(Category.query().where({ parentId: null }))
+            .step(Category.query().where({ title: 'active' }).orderBy('title').limit(5))
+            .on((cte, step) => eq(cte.id, step.parentId))
+            .toSQL().sql.toLowerCase()
+
+        const fromIdx = text.lastIndexOf('from "categories"')
+        const joinIdx = text.indexOf('inner join "categories__recursive" on', fromIdx)
+        const whereIdx = text.indexOf('where', fromIdx)
+        const orderIdx = text.indexOf('order by', fromIdx)
+        const limitIdx = text.indexOf('limit', fromIdx)
+
+        expect(joinIdx).toBeGreaterThan(fromIdx)
+        expect(whereIdx).toBeGreaterThan(joinIdx)
+        expect(orderIdx).toBeGreaterThan(whereIdx)
+        expect(limitIdx).toBeGreaterThan(orderIdx)
     })
 })
 
@@ -228,5 +285,52 @@ describe('misuse', () => {
     it('a missing join condition is rejected', () => {
         expect(() => Category.recursiveQuery().anchor(Category.query()).step(Category.query()).toSQL())
             .toThrow(/\.on\(/)
+    })
+})
+
+describe('existsRelation on a recursive query correlates to the twin, not the real table', () => {
+    // Article is a plain (non-self-referencing) relation of Category, so the two sides of the
+    // correlation are unambiguous: the parent side must be the CTE the outer query actually
+    // selects from ("categories__recursive"), the child side the real "articles" table.
+    it('the parent side of the EXISTS is the recursive twin', () => {
+        const query = tree()
+        const text = query.where(query.existsRelation(Article)).toSQL().sql
+
+        expect(text).toContain('"articles"."category_id" = "categories__recursive"."id"')
+        // the bug this guards against: correlating to the real (non-CTE) table compiles and
+        // "runs", but references a table the outer query never puts in scope
+        expect(text).not.toMatch(/"articles"\."category_id" = "categories"\."id"/)
+    })
+
+    it('ref() exposes the same twin — the delegate `DBModelQuery.existsRelation` builds on', () => {
+        const query = tree()
+        expect(query.ref().table).toBe((Category as unknown as { meta: { recursiveTable: unknown } }).meta.recursiveTable)
+    })
+
+    it('the on() callback receives a third TableRef argument wrapping the step term', () => {
+        let captured: TableRef | undefined
+        const text = Category.recursiveQuery()
+            .anchor(Category.query().where({ parentId: null }))
+            .step(Category.query())
+            .on((cte, step, stepRef) => {
+                captured = stepRef
+                return eq(cte.id, stepRef.column('parentId'))
+            })
+            .toSQL().sql
+
+        expect(captured).toBeInstanceOf(TableRef)
+        expect(captured?.table).toBe((Category as unknown as { meta: { drizzleTable: unknown } }).meta.drizzleTable)
+        expect(captured?.meta.tableName).toBe('categories')
+        expect(text).toContain('"categories__recursive"."id" = "categories"."parent_id"')
+    })
+
+    it('a self-referencing existsRelation on a recursive query does not alias the twin against itself', () => {
+        // the twin and the real table are never the same object, so "parent -> Category" from a
+        // recursive query correlates without needing (or getting) a self-join alias
+        const query = tree()
+        const text = query.where(query.existsRelation({ as: 'parent' })).toSQL().sql
+
+        expect(text).toContain('"categories"."id" = "categories__recursive"."parent_id"')
+        expect(text).not.toContain('categories__exists')
     })
 })

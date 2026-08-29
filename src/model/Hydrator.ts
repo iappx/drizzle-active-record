@@ -1,7 +1,29 @@
 import { ModelRegistry } from '../registry/ModelRegistry'
 import { RelationForeignKey } from '../schema/RelationForeignKey'
 
+/**
+ * Turns raw database rows into model instances, nested relation rows included.
+ *
+ * Every read path and every write that returns rows goes through it; call it directly when a row
+ * comes from a hand-written statement.
+ */
 export class Hydrator {
+    /**
+     * Builds a model instance from a raw database row.
+     *
+     * Column values land in `dataValues`. A key that matches neither a column nor a relation is set
+     * both as a plain property and as a data value. Relation keys are hydrated recursively into
+     * instances of the related model, `belongsToMany` through the junction rows. The instance comes
+     * back clean — no field is marked as changed.
+     *
+     * @returns `null` when the row is `null` or `undefined`
+     * @throws {Error} When the model is not registered in `ModelRegistry`
+     *
+     * @example
+     * ```ts
+     * const author = Hydrator.hydrate(Author, { id: 1, name: 'Ada' })
+     * ```
+     */
     static hydrate<M>(ctor: new () => M, row: Record<string, unknown> | null | undefined): M | null {
         if (row == null) {
             return null
@@ -21,8 +43,6 @@ export class Hydrator {
 
         for (const key of Object.keys(row)) {
             if (!columnKeys.has(key) && !relationKeys.has(key)) {
-                // computed columns (select extras, aggregates) are reachable both as a plain
-                // property and through getDataValue(), the way a real column is
                 inst[key] = row[key]
                 inst.setDataValue(key, row[key])
             }
@@ -63,6 +83,16 @@ export class Hydrator {
         return inst as M
     }
 
+    /**
+     * Hydrates every row of the array, keeping their order.
+     *
+     * @returns An empty array for an empty input
+     *
+     * @example
+     * ```ts
+     * const authors = Hydrator.hydrateMany(Author, [{ id: 1, name: 'Ada' }, { id: 2, name: 'Grace' }])
+     * ```
+     */
     static hydrateMany<M>(ctor: new () => M, rows: Record<string, unknown>[]): M[] {
         return rows.map(r => this.hydrate(ctor, r) as M)
     }
