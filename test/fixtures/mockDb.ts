@@ -21,6 +21,7 @@ export type TMockDb = {
         set: jest.Mock
         values: jest.Mock
         onConflictDoUpdate: jest.Mock
+        onConflictDoNothing: jest.Mock
         updateWhere: jest.Mock
         deleteWhere: jest.Mock
         findMany: jest.Mock
@@ -54,6 +55,7 @@ export function createMockDb(tableNames: string[]): TMockDb {
             set: jest.fn(),
             values: jest.fn(),
             onConflictDoUpdate: jest.fn(),
+            onConflictDoNothing: jest.fn(),
             updateWhere: jest.fn(),
             deleteWhere: jest.fn(),
             findMany: jest.fn(),
@@ -109,6 +111,10 @@ export function createMockDb(tableNames: string[]): TMockDb {
                         returning: async () => state.returningRows,
                         onConflictDoUpdate: (cfg: unknown) => {
                             state.calls.onConflictDoUpdate(cfg)
+                            return { returning: async () => state.returningRows }
+                        },
+                        onConflictDoNothing: (cfg: unknown) => {
+                            state.calls.onConflictDoNothing(cfg)
                             return { returning: async () => state.returningRows }
                         },
                     }

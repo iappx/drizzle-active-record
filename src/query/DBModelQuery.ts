@@ -69,6 +69,7 @@ export class DBModelQuery<M> {
     protected node: QueryNode = new QueryNode()
     protected tx?: Tx
     protected replica = false
+    protected locked = false
     protected readonly meta: TTableMeta
 
     // exists() replays these: the built conditions already name this query's own table
@@ -752,6 +753,27 @@ export class DBModelQuery<M> {
     }
 
     /**
+     * Locks the matching rows until the end of the transaction: `select … for update`.
+     *
+     * The query runs as a flat select, like a grouped one. Relations cannot be loaded on it. Outside
+     * a {@link transaction} the lock is released as soon as the statement completes.
+     *
+     * @returns The same query, for chaining
+     *
+     * @example
+     * ```ts
+     * await Orm.db.transaction(async tx => {
+     *     const author = await Author.query().transaction(tx).forUpdate().tryFindByPk(1)
+     *     await author.update({ age: author.age + 1 }, { transaction: tx })
+     * })
+     * ```
+     */
+    public forUpdate(): this {
+        this.locked = true
+        return this
+    }
+
+    /**
      * Opens a typed sub-query on a relation, closed with `endInclude()`.
      *
      * The returned branch takes its own `where`, `select`, `orderBy`, `limit` and further
@@ -821,7 +843,7 @@ export class DBModelQuery<M> {
      * ```
      */
     public async getAll(): Promise<M[]> {
-        const rows = this.node.groupBy.length ? await this.runGroupedSelect() : await this.runFindMany()
+        const rows = this.isFlat() ? await this.runFlatSelect() : await this.runFindMany()
         return Hydrator.hydrateMany(this.modelCtor, rows)
     }
 
@@ -929,7 +951,14 @@ export class DBModelQuery<M> {
         return selection
     }
 
-    private async runGroupedSelect(): Promise<Record<string, unknown>[]> {
+    private isFlat(): boolean {
+        return this.node.groupBy.length > 0 || this.locked
+    }
+
+    private async runFlatSelect(): Promise<Record<string, unknown>[]> {
+        if (this.locked && Object.keys(this.node.with).length > 0) {
+            throw new Error(`Relations cannot be loaded on a query of ${this.meta.tableName} that locks its rows`)
+        }
         return QueryExecutor.run<Record<string, unknown>[]>(() => this.buildSelectQuery())
     }
 
@@ -992,6 +1021,9 @@ export class DBModelQuery<M> {
         if (this.node.offset != null) {
             query = query.offset(this.node.offset)
         }
+        if (this.locked) {
+            query = query.for('update')
+        }
         return QueryExecutor.run<Record<string, unknown>[]>(() => query)
     }
 
@@ -1004,8 +1036,8 @@ export class DBModelQuery<M> {
      * ```
      */
     public async getOne(): Promise<M | null> {
-        if (this.node.groupBy.length) {
-            const rows = await this.limit(1).runGroupedSelect()
+        if (this.isFlat()) {
+            const rows = await this.limit(1).runFlatSelect()
             return Hydrator.hydrate(this.modelCtor, rows[0])
         }
         const cfg = this.buildConfig(this.node, this.meta)

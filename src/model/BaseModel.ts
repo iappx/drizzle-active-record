@@ -269,7 +269,8 @@ export abstract class BaseModel<M extends BaseModel = any, CA extends object = a
      * hydrated.
      *
      * An empty array returns `[]` without touching the database. With neither `updateKeys` nor
-     * `incrementKeys` the `SET` clause is empty. A key naming no column of the model is skipped.
+     * `incrementKeys` the clause is `ON CONFLICT ... DO NOTHING`: a conflicting row is left as it is
+     * and is not among the returned rows. A key naming no column of the model is skipped.
      *
      * @example
      * ```ts
@@ -278,6 +279,9 @@ export abstract class BaseModel<M extends BaseModel = any, CA extends object = a
      *     incrementKeys: ['age'],
      * })
      * // on conflict (name) do update set "age" = "authors"."age" + excluded.age
+     *
+     * await Author.bulkUpsert([{ name: 'Ada' }], { conflictKeys: ['name'] })
+     * // on conflict (name) do nothing
      * ```
      */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -309,7 +313,11 @@ export abstract class BaseModel<M extends BaseModel = any, CA extends object = a
             }
         }
 
-        const written = await QueryExecutor.run<Record<string, unknown>[]>(() => Orm.conn(opts.transaction).insert(table).values(rows).onConflictDoUpdate({ target, set }).returning())
+        const insert = Orm.conn(opts.transaction).insert(table).values(rows)
+        const statement = Object.keys(set).length > 0
+            ? insert.onConflictDoUpdate({ target, set })
+            : insert.onConflictDoNothing({ target })
+        const written = await QueryExecutor.run<Record<string, unknown>[]>(() => statement.returning())
         return Hydrator.hydrateMany(this, written)
     }
 

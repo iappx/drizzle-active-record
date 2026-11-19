@@ -1,6 +1,6 @@
 {
   "name": "@iappx/drizzle-active-record",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A decorator-driven Active Record layer over Drizzle ORM for PostgreSQL: declare entities with decorators, get a chainable query builder, relations, soft delete and hydration on top of the generated Drizzle schema.",
   "homepage": "https://github.com/iappx/drizzle-active-record#readme",
   "repository": {

@@ -353,6 +353,7 @@ Orm.init({ pool, modelNotFoundErrorFactory: model => new MyNotFoundException(mod
 | `.include(...)` / `.includeQueryable(..., { as?, required? })` | Raw includes; `{ required: true }` becomes `WHERE EXISTS`. |
 | `.existsRelation({ model?, as?, where? })` | That same `WHERE EXISTS` returned as a condition instead of applied. See [Filtering by a relation](#filtering-by-a-relation-without-loading-it). |
 | `.transaction(tx)` | Runs inside an existing Drizzle transaction. |
+| `.forUpdate()` | Locks the matching rows until the transaction ends — `select … for update`, as a flat select without relations. |
 | `.useReplica()` / `.useMaster()` | Picks the connection for this read. |
 | `.column(field)` | The underlying Drizzle column, for hand-written `SQL`. Also available as [`Model.column(field)`](#-raw-sql-escape-hatches) without a query. |
 
@@ -929,6 +930,7 @@ await TrainingProgram.bulkUpsert(rows, {
     updateKeys: ['title'],          // ... DO UPDATE SET title = excluded.title
     incrementKeys: ['viewsCount'],  // ... views_count = views_count + excluded.views_count
 })
+await TrainingProgram.bulkUpsert(rows, { conflictKeys: ['externalId'] })   // ... DO NOTHING
 await TrainingProgram.update({ archivedAt: new Date() }, { where: { userId } })
 await TrainingProgram.destroy({ where: { userId } })
 const draft = TrainingProgram.build({ title })   // in-memory only, not saved

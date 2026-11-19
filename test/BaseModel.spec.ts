@@ -400,7 +400,7 @@ describe('static bulkUpsert', () => {
 
     it('inserts through the model drizzle table with the provided rows', async () => {
         const rows = [{ name: 'A' }, { name: 'B' }]
-        await Author.bulkUpsert(rows, { conflictKeys: ['name'] })
+        await Author.bulkUpsert(rows, { conflictKeys: ['name'], updateKeys: ['name'] })
         expect(mock.calls.insert).toHaveBeenCalledTimes(1)
         expect(mock.calls.insert).toHaveBeenCalledWith(Author.meta.drizzleTable)
         expect(mock.calls.values).toHaveBeenCalledWith(rows)
@@ -408,7 +408,7 @@ describe('static bulkUpsert', () => {
     })
 
     it('uses the conflict keys as the ON CONFLICT target columns', async () => {
-        await Author.bulkUpsert([{ name: 'A', age: 1 }], { conflictKeys: ['name'] })
+        await Author.bulkUpsert([{ name: 'A', age: 1 }], { conflictKeys: ['name'], updateKeys: ['age'] })
         const table = Author.meta.drizzleTable as any
         const { target } = upsertArg()
         expect(target).toHaveLength(1)
@@ -416,7 +416,7 @@ describe('static bulkUpsert', () => {
     })
 
     it('supports a composite conflict target', async () => {
-        await AuthorTag.bulkUpsert([{ authorId: 1, tagId: 2 }], { conflictKeys: ['authorId', 'tagId'] })
+        await AuthorTag.bulkUpsert([{ authorId: 1, tagId: 2 }], { conflictKeys: ['authorId', 'tagId'], updateKeys: ['tagId'] })
         const table = AuthorTag.meta.drizzleTable as any
         const { target } = upsertArg()
         expect(target).toEqual([table.authorId, table.tagId])
@@ -424,16 +424,18 @@ describe('static bulkUpsert', () => {
 
     it('returns the written rows hydrated into instances', async () => {
         mock.returningRows = [{ id: 3, name: 'A' }]
-        const res = await Author.bulkUpsert([{ name: 'A' }], { conflictKeys: ['name'] })
+        const res = await Author.bulkUpsert([{ name: 'A' }], { conflictKeys: ['name'], updateKeys: ['name'] })
         expect(res).toHaveLength(1)
         expect(res[0]).toBeInstanceOf(Author)
         expect(res[0].id).toBe(3)
     })
 
     describe('SET clause', () => {
-        it('is empty when neither update nor increment keys are given', async () => {
+        it('is replaced by do nothing when neither update nor increment keys are given', async () => {
             await Author.bulkUpsert([{ name: 'A' }], { conflictKeys: ['name'] })
-            expect(upsertArg().set).toEqual({})
+            const table = Author.meta.drizzleTable as any
+            expect(mock.calls.onConflictDoUpdate).not.toHaveBeenCalled()
+            expect(mock.calls.onConflictDoNothing).toHaveBeenCalledWith({ target: [table.name] })
         })
 
         it('updateKeys overwrite the column with the incoming excluded value', async () => {
