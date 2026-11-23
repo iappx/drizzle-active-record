@@ -45,6 +45,26 @@ describe('accessors', () => {
     })
 })
 
+describe('toJSON() — serializing an instance', () => {
+    it('serializes the row, not the internal state', () => {
+        const a = Author.hydrate({ id: 1, name: 'Ada' }) as Author
+        a.name = 'Grace'
+        expect(JSON.parse(JSON.stringify(a))).toEqual({ id: 1, name: 'Grace' })
+    })
+
+    it('turns loaded relations into plain objects', () => {
+        const a = Author.hydrate({ id: 1, name: 'Ada', books: [{ id: 7, title: 'Notes', authorId: 1 }] }) as Author
+        const plain = a.toJSON()
+        expect(plain.books).toEqual([{ id: 7, title: 'Notes', authorId: 1 }])
+        expect((plain.books as unknown[])[0]).not.toBeInstanceOf(Book)
+    })
+
+    it('keeps a loaded empty relation', () => {
+        const a = Author.hydrate({ id: 1, name: 'Ada', books: [] }) as Author
+        expect(a.toJSON()).toEqual({ id: 1, name: 'Ada', books: [] })
+    })
+})
+
 describe('changed()', () => {
     it('returns false when nothing changed', () => {
         const a = Author.hydrate({ id: 1, name: 'A' }) as Author

@@ -81,10 +81,14 @@ describe('read-back mode', () => {
         expect(columnOf('amount').mapFromDriverValue('10.25')).toBe(10.25)
     })
 
-    it('DECIMAL(p, s, { mode: "string" }) hands the value back verbatim', () => {
-        expect(columnOf('exactAmount').dataType).toBe('string')
+    it('DECIMAL(p, s, { mode: "string" }) hands a driver string back verbatim', () => {
         // the point of the mode: a value a JS number cannot hold exactly survives untouched
         expect(columnOf('exactAmount').mapFromDriverValue('12345678901234.5678')).toBe('12345678901234.5678')
+    })
+
+    it('DECIMAL(p, s, { mode: "string" }) restores the scale of a number read from a relation JSON row', () => {
+        expect(columnOf('exactAmount').mapFromDriverValue(1000)).toBe('1000.0000')
+        expect(columnOf('exactAmount').mapFromDriverValue(-1.4)).toBe('-1.4000')
     })
 
     it('DECIMAL({ mode: "string" }) applies the mode without precision or scale', () => {

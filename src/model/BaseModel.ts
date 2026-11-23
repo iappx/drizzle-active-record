@@ -385,6 +385,26 @@ export abstract class BaseModel<M extends BaseModel = any, CA extends object = a
     }
 
     /**
+     * The instance as a plain object: columns, computed select extras and loaded relations, the
+     * relations turned into plain objects as well.
+     *
+     * `JSON.stringify` calls it, so a serialized model carries its row and not its internal state.
+     *
+     * @example
+     * ```ts
+     * const author = await Author.query().include([Book]).tryFindByPk(1)
+     * JSON.stringify(author) // {"id":1,"name":"Ada","books":[{"id":7,"title":"Notes"}]}
+     * ```
+     */
+    public toJSON(): Record<string, unknown> {
+        const plain: Record<string, unknown> = {}
+        for (const [key, value] of Object.entries(this.dataValues)) {
+            plain[key] = BaseModel.toPlain(value)
+        }
+        return plain
+    }
+
+    /**
      * Reads or sets the dirty state of the instance.
      *
      * With no argument it returns a fresh array of the changed keys, or `false` when nothing
@@ -553,6 +573,16 @@ export abstract class BaseModel<M extends BaseModel = any, CA extends object = a
             }
         }
         return this
+    }
+
+    private static toPlain(value: unknown): unknown {
+        if (value instanceof BaseModel) {
+            return value.toJSON()
+        }
+        if (Array.isArray(value)) {
+            return value.map(item => BaseModel.toPlain(item))
+        }
+        return value
     }
 
     private applyRow(meta: TTableMeta, row: Record<string, unknown>): void {

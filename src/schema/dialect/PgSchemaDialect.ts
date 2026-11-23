@@ -42,6 +42,16 @@ const timestampValue = customType<{ data: Date; driverData: any }>({
     fromDriver: (value: unknown): Date => (value instanceof Date ? value : new Date(value as string)),
 })
 
+// a relation loaded through the relational query builder arrives inside a JSON row, where Postgres writes
+// `numeric` as a JSON number: `1000.00` comes back as 1000, and digits past a double's precision are gone
+const scaledDecimalString = (precision: number | undefined, scale: number) => customType<{
+    data: string
+    driverData: string | number
+}>({
+    dataType: () => (precision === undefined ? 'numeric' : `numeric(${precision}, ${scale})`),
+    fromDriver: (value: string | number): string => (typeof value === 'number' ? value.toFixed(scale) : value),
+})
+
 /**
  * The PostgreSQL schema dialect: builds `pgTable`s and `pg-core` column builders from model metadata.
  *
@@ -71,7 +81,9 @@ export class PgSchemaDialect implements ISchemaDialect {
      * Builds the `pg-core` column builder for a column, from its declared data type.
      *
      * A `DATE` column accepts a `Date`, an ISO or SQL string and an epoch number, and always reads
-     * back as a `Date`. An `ARRAY` without an item type and a `CUSTOM` without a database type throw.
+     * back as a `Date`. A `DECIMAL` in `string` mode with a scale reads back with that scale, from a
+     * plain row and from a relation's JSON row alike. An `ARRAY` without an item type and a `CUSTOM`
+     * without a database type throw.
      *
      * @throws {Error} When the data type is `array` without `itemType`, or `custom` without `sqlType`
      */
@@ -93,6 +105,9 @@ export class PgSchemaDialect implements ISchemaDialect {
             case 'double':
                 return doublePrecision(name)
             case 'decimal':
+                if (dataType.mode === 'string' && dataType.scale !== undefined) {
+                    return scaledDecimalString(dataType.precision, dataType.scale)(name)
+                }
                 return numeric(name, {
                     precision: dataType.precision,
                     scale: dataType.scale,
